@@ -1,44 +1,51 @@
 import os
+import asyncio
 from flask import Flask, request
-from threading import Thread
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Load token from Render Environment Variable
+# === Load BOT TOKEN ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = "https://oil-tracking-bot.onrender.com/webhook"
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://oil-tracking-bot.onrender.com{WEBHOOK_PATH}"
 
-# === Flask app for webhook and uptime check ===
+# === Flask App for UptimeRobot Pings ===
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def index():
     return "✅ Bot is alive."
 
-@flask_app.route('/webhook', methods=['POST'])
+# Telegram Application (no Updater used)
+application = Application.builder().token(BOT_TOKEN).build()
+
+@flask_app.route(WEBHOOK_PATH, methods=['POST'])
 async def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
     await application.process_update(update)
     return 'OK'
 
-# === Telegram bot logic ===
+# === Telegram Command Handlers ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Your bot is alive 🎉")
+    await update.message.reply_text("Hello! The bot is now alive via webhook 🚀")
 
-# === Telegram bot app setup ===
-application = Application.builder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 
-# === Flask + Webhook runner ===
+# === Run Flask + Register Webhook ===
 def run():
     flask_app.run(host="0.0.0.0", port=8080)
 
-def main():
+async def main():
+    # Start Flask in a background thread
+    from threading import Thread
     Thread(target=run).start()
 
-    # Set Telegram webhook once app starts
-    import asyncio
-    asyncio.run(application.bot.set_webhook(WEBHOOK_URL))
+    # Set webhook
+    await application.bot.set_webhook(url=WEBHOOK_URL)
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
