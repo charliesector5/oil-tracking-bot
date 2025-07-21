@@ -18,7 +18,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def index():
-    return "✅ Bot is alive."
+    return "✅ Bot is alive test1."
 
 # Telegram Application (no Updater used)
 application = Application.builder().token(BOT_TOKEN).build()
