@@ -1,37 +1,32 @@
-import os
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import os
 
-# Get environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+TOKEN = os.environ.get("BOT_TOKEN")
+APP_URL = os.environ.get("RENDER_EXTERNAL_URL")  # e.g., "https://your-bot.onrender.com"
 
-# Initialize Flask
-web_app = Flask(__name__)
+app = Flask(__name__)
 
-# Telegram webhook endpoint
-@web_app.route("/webhook", methods=["POST"])
-async def webhook():
-    data = request.get_json(force=True)
-    await application.process_update(Update.de_json(data, application.bot))
-    return "ok"
+application = ApplicationBuilder().token(TOKEN).build()
 
-# Define a simple command
+# Example command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Your bot is live.")
+    await update.message.reply_text("Hello from your bot!")
 
-# Start the Telegram bot application
-application = Application.builder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 
-# Main startup
-if __name__ == "__main__":
-    print("Setting webhook...")
+# Flask route to receive webhooks
+@app.route(f"/{TOKEN}", methods=["POST"])
+async def webhook_handler():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return "OK"
 
-    # Start webhook with built-in aiohttp server
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url=f"{RENDER_EXTERNAL_URL}/webhook"
-    )
+# Set webhook on startup
+@app.before_first_request
+def setup_webhook():
+    application.bot.set_webhook(f"{APP_URL}/{TOKEN}")
+
+if __name__ == "__main__":
+    app.run(port=10000, host="0.0.0.0")
