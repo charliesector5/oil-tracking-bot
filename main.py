@@ -1,35 +1,36 @@
 import os
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = f"https://https://oil-tracking-bot.onrender.com/{TOKEN}"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Bot is running!"
-
-@app.post(WEBHOOK_PATH)
-async def webhook() -> str:
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return "ok"
-
+# Define bot command handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Your bot is alive.")
+    await update.message.reply_text("Hello! Bot is alive.")
 
-application = Application.builder().token(TOKEN).build()
+# Create bot app
+app = Flask(__name__)
+application = Application.builder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 
-if __name__ == "__main__":
-    # Set webhook on startup
-    import asyncio
-    async def run():
-        await application.bot.set_webhook(WEBHOOK_URL)
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# Webhook endpoint
+@app.route("/webhook", methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return "OK"
 
-    asyncio.run(run())
+# Start webhook
+@app.before_first_request
+def setup_webhook():
+    application.bot.set_webhook(url=WEBHOOK_URL)
+
+# Flask runner
+if __name__ == "__main__":
+    app.run(port=5000, host="0.0.0.0")
