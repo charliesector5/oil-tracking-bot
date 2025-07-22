@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = f"https://<your-render-service-name>.onrender.com/{TOKEN}"
+WEBHOOK_URL = f"https://https://oil-tracking-bot.onrender.com/{TOKEN}"
 
 app = Flask(__name__)
 
