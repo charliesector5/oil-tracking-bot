@@ -1,28 +1,37 @@
 import os
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from dotenv import load_dotenv
 
-# Load environment variables from .env
-load_dotenv()
+# Get environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# Basic start command
+# Initialize Flask
+web_app = Flask(__name__)
+
+# Telegram webhook endpoint
+@web_app.route("/webhook", methods=["POST"])
+async def webhook():
+    data = request.get_json(force=True)
+    await application.process_update(Update.de_json(data, application.bot))
+    return "ok"
+
+# Define a simple command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is up and running!")
+    await update.message.reply_text("Hello! Your bot is live.")
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("❌ BOT_TOKEN is not set in the .env file")
+# Start the Telegram bot application
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
 
-    # Build the application with the bot token
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-
-    # Run the bot
-    application.run_polling()
-
+# Main startup
 if __name__ == "__main__":
-    main()
+    print("Setting webhook...")
+
+    # Start webhook with built-in aiohttp server
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        webhook_url=f"{RENDER_EXTERNAL_URL}/webhook"
+    )
