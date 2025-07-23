@@ -1,36 +1,47 @@
 import os
+import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
+    ApplicationBuilder,
     ContextTypes,
+    CommandHandler,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("APP_URL")  # Set in Render as your app domain
 
-# Define bot command handler
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Bot is alive.")
-
-# Create bot app
+# Create Flask app
 app = Flask(__name__)
-application = Application.builder().token(BOT_TOKEN).build()
+
+# Create PTB application
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# Example /start command handler
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello! Bot is working.")
+
 application.add_handler(CommandHandler("start", start))
 
-# Webhook endpoint
-@app.route("/webhook", methods=["POST"])
-async def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+# Webhook endpoint to receive updates
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+async def webhook_handler():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
     await application.process_update(update)
-    return "OK"
+    return "ok"
 
-# Start webhook
-@app.before_first_request
-def setup_webhook():
-    application.bot.set_webhook(url=WEBHOOK_URL)
+# Root route for status check
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!"
 
-# Flask runner
+# Set webhook before first request
+@app.before_serving
+async def setup_webhook():
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}")
+
 if __name__ == "__main__":
-    app.run(port=5000, host="0.0.0.0")
+    # Use asyncio to run Flask with PTB
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
