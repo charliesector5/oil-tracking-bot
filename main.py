@@ -1,6 +1,6 @@
 import os
 import asyncio
-from flask import Flask, request
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -8,31 +8,33 @@ from telegram.ext import (
     ContextTypes,
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+application: Application = Application.builder().token(TOKEN).build()
 
-# Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Define the command handler
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Welcome to the OIL tracking bot!")
 
+# Add the handler
 application.add_handler(CommandHandler("start", start))
 
-@app.route('/')
-def index():
-    return 'Bot is running!'
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is running!"
 
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
-async def webhook() -> str:
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return "ok"
+# Set webhook only once when the app starts
+async def set_webhook_once():
+    await application.bot.set_webhook(url=WEBHOOK_URL)
 
-@app.before_first_request
-def setup_webhook():
-    asyncio.run(application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook/{TOKEN}"))
+if __name__ == "__main__":
+    async def run():
+        await set_webhook_once()
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()  # This won't receive messages when using webhook, but allows graceful init
+        app.run(host="0.0.0.0", port=5000)
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000)
+    asyncio.run(run())
