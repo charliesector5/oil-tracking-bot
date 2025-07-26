@@ -36,10 +36,10 @@ async def webhook_handler():
 def index():
     return "Bot is running!"
 
-# Set webhook before first request
-@app.before_serving
-async def setup_webhook():
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}")
+@app.before_first_request
+def start():
+    import asyncio
+    asyncio.create_task(application.bot.set_webhook(url=WEBHOOK_URL))
 
 if __name__ == "__main__":
     # Use asyncio to run Flask with PTB
