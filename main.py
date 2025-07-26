@@ -3,45 +3,44 @@ import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
+    Application,
     CommandHandler,
+    ContextTypes,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("APP_URL")  # Set in Render as your app domain
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Create Flask app
 app = Flask(__name__)
 
-# Create PTB application
-application = ApplicationBuilder().token(BOT_TOKEN).build()
+# Initialize the Telegram application
+application = Application.builder().token(TOKEN).build()
 
-# Example /start command handler
+# --- Telegram bot command handlers ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Bot is working.")
+    await update.message.reply_text("Welcome to the OIL tracking bot!")
 
 application.add_handler(CommandHandler("start", start))
 
-# Webhook endpoint to receive updates
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-async def webhook_handler():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, application.bot)
+# --- Flask Routes ---
+
+@app.route('/')
+def index():
+    return 'Bot is running!'
+
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+async def webhook() -> str:
+    update = Update.de_json(request.get_json(force=True), application.bot)
     await application.process_update(update)
     return "ok"
 
-# Root route for status check
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running!"
-
 @app.before_first_request
-def start():
-    import asyncio
-    asyncio.create_task(application.bot.set_webhook(url=WEBHOOK_URL))
+def setup_webhook():
+    # Set the webhook once Flask app is ready
+    asyncio.run(application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook/{TOKEN}"))
 
-if __name__ == "__main__":
-    # Use asyncio to run Flask with PTB
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+# --- Start the Flask app ---
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000)
