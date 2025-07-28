@@ -1,60 +1,51 @@
 import os
+import asyncio
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-import asyncio
+from telegram.ext import Application, CommandHandler, ContextTypes
+from dotenv import load_dotenv
 
-TOKEN = os.environ.get("BOT_TOKEN")
-APP_URL = os.environ.get("APP_URL")
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN") or "7592365034:AAGApLgD-my9Fek0rm5S81Gr5msiEoeE9Ek"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") or "https://oil-tracking-bot.onrender.com"
 
 app = Flask(__name__)
 
-application = ApplicationBuilder().token(TOKEN).build()
+# Telegram application (v20+ async)
+application = Application.builder().token(TOKEN).build()
 
 
-# === Command Handlers ===
+# === Telegram Bot Handlers ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Your bot is up and running.")
-
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(update.message.text)
+    await update.message.reply_text("Hello! Bot is working.")
 
 
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
 
-# === Register Webhook on first request ===
-@app.before_first_request
-def register_webhook():
-    async def set_webhook():
-        webhook_url = f"{APP_URL}/{TOKEN}"
-        await application.bot.set_webhook(url=webhook_url)
-        print(f"✅ Webhook set to: {webhook_url}")
-    
-    asyncio.get_event_loop().create_task(set_webhook())
-
-
-# === Flask Route for Telegram Webhook ===
+# === Flask Endpoint ===
 @app.route(f"/{TOKEN}", methods=["POST"])
-async def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return "ok", 200
+def webhook():
+    """Handle incoming Telegram updates via webhook."""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        asyncio.create_task(application.process_update(update))
+        return "ok", 200
 
 
-# === Root Route ===
-@app.route("/")
+@app.route("/", methods=["GET", "HEAD"])
 def index():
-    return "Bot is running."
+    return "Bot is running!", 200
+
+
+# === Set Webhook on Startup ===
+async def set_webhook():
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    print(f"✅ Webhook set to: {WEBHOOK_URL}/{TOKEN}")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    import uvicorn
+    asyncio.run(set_webhook())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
