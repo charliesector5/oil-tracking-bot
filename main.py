@@ -1,41 +1,60 @@
+import os
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import threading
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 import asyncio
-import os
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://oil-tracking-bot.onrender.com
+TOKEN = os.environ.get("BOT_TOKEN")
+APP_URL = os.environ.get("APP_URL")
 
 app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
 
+application = ApplicationBuilder().token(TOKEN).build()
+
+
+# === Command Handlers ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello! Your bot is up and running.")
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(update.message.text)
+
+
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+
+# === Register Webhook on first request ===
+@app.before_first_request
+def register_webhook():
+    async def set_webhook():
+        webhook_url = f"{APP_URL}/{TOKEN}"
+        await application.bot.set_webhook(url=webhook_url)
+        print(f"✅ Webhook set to: {webhook_url}")
+    
+    asyncio.get_event_loop().create_task(set_webhook())
+
+
+# === Flask Route for Telegram Webhook ===
 @app.route(f"/{TOKEN}", methods=["POST"])
 async def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
     await application.process_update(update)
-    return "ok"
+    return "ok", 200
 
+
+# === Root Route ===
 @app.route("/")
 def index():
-    return "Bot is running!"
+    return "Bot is running."
 
-def set_webhook():
-    async def _set():
-        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    asyncio.run(_set())
-
-# Start webhook setup in a background thread
-@app.before_first_request
-def activate_webhook():
-    threading.Thread(target=set_webhook).start()
-
-# Example command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! I'm alive.")
-
-application.add_handler(CommandHandler("start", start))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
