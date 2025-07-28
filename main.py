@@ -36,6 +36,7 @@ def webhook():
 
 @app.route("/", methods=["GET", "HEAD"])
 def index():
+    asyncio.run(set_webhook())  # ✅ Safe to run in synchronous context
     return "Bot is running!", 200
 
 
