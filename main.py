@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-TOKEN = os.getenv("BOT_TOKEN") or "7592365034:AAGApLgD-my9Fek0rm5S81Gr5msiEoeE9Ek"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or "https://oil-tracking-bot.onrender.com"
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Initialize Flask and Telegram app
 app = Flask(__name__)
