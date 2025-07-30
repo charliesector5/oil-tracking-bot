@@ -132,8 +132,8 @@ application.add_handler(
 # Flask webhook endpoint
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), application.bot)
-
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    
     async def handle_update():
         # This is the missing piece
         if not application.initialized:
