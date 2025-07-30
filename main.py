@@ -132,8 +132,19 @@ application.add_handler(
 # Flask webhook endpoint
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run(application.process_update(update))
+    update = telegram.Update.de_json(request.get_json(force=True), application.bot)
+
+    async def handle_update():
+        # This is the missing piece
+        if not application.initialized:
+            await application.initialize()
+        await application.process_update(update)
+
+    try:
+        asyncio.run(handle_update())
+    except Exception as e:
+        logging.error(f"Exception on webhook: {e}")
+
     return "OK"
 
 # Webhook setup (executed only once)
