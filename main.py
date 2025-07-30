@@ -1,125 +1,145 @@
 import os
-import json
 import asyncio
+import logging
+import sqlite3
 from datetime import datetime
 from flask import Flask, request
-from telegram import Update, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler,
-    filters, ConversationHandler
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    CallbackQueryHandler
 )
-from dotenv import load_dotenv
-import pytz
 
-# === Load environment ===
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# ENV
+TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://yourbot.onrender.com
 
-# === Flask setup ===
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Flask App
 app = Flask(__name__)
 
-# === Telegram App ===
-application = Application.builder().token(TOKEN).build()
+# SQLite DB Setup
+DB_PATH = "oil.db"
 
-# === Clockoff conversation states ===
-DAYS, REMARKS = range(2)
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS oil_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            timestamp TEXT NOT NULL,
+            days REAL NOT NULL,
+            remark TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-# === JSON logging helper ===
-def save_entry(data, file="clockoff_log.json"):
-    if not os.path.exists(file):
-        with open(file, "w") as f:
-            json.dump([], f)
-    with open(file, "r+") as f:
-        log = json.load(f)
-        log.append(data)
-        f.seek(0)
-        json.dump(log, f, indent=2)
+init_db()
 
-# === /clockoff entry ===
-async def clockoff_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ You're clocking off!\n"
-        "How many days of off would you like to clock in?\n"
-        "*(Reply in multiples of 0.5 — e.g., 0.5, 1, 1.5)*"
-    )
-    return DAYS
+# Telegram Bot App
+application = ApplicationBuilder().token(TOKEN).build()
 
-async def clockoff_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Conversation states
+SELECT_DAYS, ENTER_REMARK = range(2)
+user_state = {}
+
+# /start handler
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello! Bot is working.")
+
+# /clockoff entry point
+async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state[update.effective_chat.id] = {}
+    keyboard = [
+        [InlineKeyboardButton("0.5", callback_data="0.5"),
+         InlineKeyboardButton("1.0", callback_data="1.0"),
+         InlineKeyboardButton("1.5", callback_data="1.5")],
+        [InlineKeyboardButton("2.0", callback_data="2.0"),
+         InlineKeyboardButton("3.0", callback_data="3.0")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("How many days of OIL to clock?", reply_markup=reply_markup)
+    return SELECT_DAYS
+
+# Callback for day selection
+async def select_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_state[query.message.chat.id]['days'] = float(query.data)
+    await query.edit_message_text("Please enter your remark for this clock off (or type 'NIL'):")
+    return ENTER_REMARK
+
+# Callback for remark input
+async def enter_remark(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    username = update.effective_user.username or "Unknown"
+    remark = update.message.text.strip()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    days = user_state[user_id].get('days')
+
     try:
-        days = float(update.message.text)
-        if days <= 0 or days * 2 % 1 != 0:
-            raise ValueError()
-        context.user_data["off_days"] = days
-        await update.message.reply_text("Please enter your remarks for this Off entry.")
-        return REMARKS
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input. Please enter a valid number in 0.5 steps.")
-        return DAYS
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO oil_log (user_id, username, timestamp, days, remark) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, timestamp, days, remark)
+        )
+        conn.commit()
+        conn.close()
 
-async def clockoff_remarks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remarks = update.message.text
-    days = context.user_data["off_days"]
-    user = update.effective_user
+        await update.message.reply_text(
+            f"✅ OIL clocked at {timestamp}\nDays: {days}\nRemark: {remark}"
+        )
+    except Exception as e:
+        logger.error(f"DB error: {e}")
+        await update.message.reply_text("⚠️ Failed to log OIL. Please try again.")
 
-    # Get SG time
-    now = datetime.now(pytz.timezone("Asia/Singapore"))
-    timestamp = now.strftime("%Y-%m-%d %H:%M")
+    user_state.pop(user_id, None)
+    return ConversationHandler.END
 
-    entry = {
-        "user_id": user.id,
-        "name": user.full_name,
-        "off_days": days,
-        "remarks": remarks,
-        "timestamp": timestamp
-    }
+# Cancel fallback
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("OIL clocking cancelled.")
+    user_state.pop(update.effective_chat.id, None)
+    return ConversationHandler.END
 
-    save_entry(entry)
+# Register handlers
+application.add_handler(CommandHandler("start", start))
 
-    await update.message.reply_text(
-        f"📝 Off clocked successfully!\n"
-        f"• Days: {days}\n"
-        f"• Remarks: {remarks}\n"
-        f"• Time: {timestamp}",
-        reply_markup=ReplyKeyboardRemove()
+application.add_handler(
+    ConversationHandler(
+        entry_points=[CommandHandler("clockoff", clockoff)],
+        states={
+            SELECT_DAYS: [CallbackQueryHandler(select_days)],
+            ENTER_REMARK: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_remark)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
-    return ConversationHandler.END
-
-async def clockoff_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Clockoff cancelled.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-# === Register handlers ===
-application.add_handler(CommandHandler("start", lambda update, ctx: update.message.reply_text("Hello! Bot is working.")))
-
-clockoff_conv = ConversationHandler(
-    entry_points=[CommandHandler("clockoff", clockoff_start)],
-    states={
-        DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, clockoff_days)],
-        REMARKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, clockoff_remarks)],
-    },
-    fallbacks=[CommandHandler("cancel", clockoff_cancel)],
 )
-application.add_handler(clockoff_conv)
 
-# === Webhook endpoints ===
+# Flask webhook endpoint
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.create_task(application.process_update(update))
-    return "ok", 200
+    asyncio.run(application.process_update(update))
+    return "OK"
 
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    asyncio.run(set_webhook())
-    return "Bot is running!", 200
-
-# === Set webhook ===
+# Webhook setup (executed only once)
 async def set_webhook():
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    print(f"✅ Webhook set to: {WEBHOOK_URL}/{TOKEN}")
 
-# === Start app ===
 if __name__ == "__main__":
     asyncio.run(set_webhook())
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=10000)
