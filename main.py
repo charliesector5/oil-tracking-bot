@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import sqlite3
+import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
@@ -76,7 +77,7 @@ async def webhook():
             initialized = True
 
         data = request.get_data()
-        update = Update.de_json(data.decode("utf-8"), application.bot)
+        update = Update.de_json(json.loads(data), application.bot)
         await application.process_update(update)
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
