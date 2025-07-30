@@ -1,6 +1,5 @@
-Flask==2.2.5
+Flask[async]==3.0.2
 python-telegram-bot[webhooks]==20.8
 httpx==0.26.0
-python-dotenv
+python-dotenv==1.0.1
 pytz==2024.1
-
