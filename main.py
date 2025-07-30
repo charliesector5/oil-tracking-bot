@@ -75,7 +75,7 @@ async def webhook():
             await application.start()
             initialized = True
 
-        data = await request.get_data()
+        data = request.get_data()
         update = Update.de_json(data.decode("utf-8"), application.bot)
         await application.process_update(update)
     except Exception as e:
