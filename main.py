@@ -54,7 +54,7 @@ def index():
 @app.route(f"/{TOKEN}", methods=["POST"])
 async def webhook():
     try:
-        data = await request.get_data()
+        data = request.get_data()
         update = Update.de_json(data.decode("utf-8"), application.bot)
         logger.info(f"Incoming update: {update.to_dict()}")
         await application.initialize()
@@ -62,7 +62,7 @@ async def webhook():
     except Exception as e:
         logger.exception("Webhook error:")
     return "", 200
-
+    
 # ===========================
 # Setup Webhook Before Launch
 # ===========================
