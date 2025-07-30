@@ -1,100 +1,90 @@
 import os
 import logging
-import asyncio
-import sqlite3
-import json
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, ContextTypes,
 )
+import asyncio
 
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Configure logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Flask
+# Flask app
 app = Flask(__name__)
 
-# Create SQLite DB
-DB_FILE = "off_tracking.db"
-
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS clocked_off (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                full_name TEXT,
-                off_days REAL,
-                remarks TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-
-# Initialize database
-init_db()
-
-# Create Telegram application
+# Telegram Application
 application = Application.builder().token(TOKEN).build()
-initialized = False  # Flag to avoid re-initializing
 
+# ===========================
 # Telegram Command Handlers
+# ===========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to the OIL Tracking Bot! Use /clockoff to clock your off.")
+    logger.info(f"/start command from user: {update.effective_user.id}")
+    await update.message.reply_text("Hello! Welcome to the OIL Tracking Bot.")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_markup = ReplyKeyboardMarkup(
-        [["0.5", "1.0", "1.5"], ["2.0", "2.5", "3.0"]],
-        one_time_keyboard=True,
-        resize_keyboard=True
-    )
-    await update.message.reply_text("How many days of off to clock (in multiples of 0.5)?", reply_markup=reply_markup)
+    logger.info(f"/clockoff command from user: {update.effective_user.id}")
+    await update.message.reply_text("Clocked off successfully.")
 
-# Register handlers
+# ===========================
+# Register Handlers
+# ===========================
+
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clockoff", clockoff))
 
-# Webhook route
-@app.post(f"/{TOKEN}")
-async def webhook():
-    global initialized
-    try:
-        if not initialized:
-            await application.initialize()
-            await application.start()
-            initialized = True
+# ===========================
+# Flask Routes
+# ===========================
 
-        data = request.get_data()
-        update = Update.de_json(json.loads(data), application.bot)
+@app.route("/")
+def index():
+    logger.info("Health check received at /")
+    return "OIL Bot is alive!", 200
+
+@app.route(f"/{TOKEN}", methods=["POST"])
+async def webhook():
+    try:
+        data = await request.get_data()
+        update = Update.de_json(data.decode("utf-8"), application.bot)
+        logger.info(f"Incoming update: {update.to_dict()}")
+        await application.initialize()
         await application.process_update(update)
     except Exception as e:
-        logger.exception(f"Webhook error: {e}")
-    return jsonify(success=True)
+        logger.exception("Webhook error:")
+    return "", 200
 
-# Root endpoint (for Render health check)
-@app.get("/")
-def index():
-    return "OIL Tracking Bot is live."
+# ===========================
+# Setup Webhook Before Launch
+# ===========================
 
-# Set webhook when app starts
-async def set_webhook():
-    url = f"{WEBHOOK_URL}/{TOKEN}"
-    async with application:
-        await application.bot.set_webhook(url=url)
-        logger.info(f"Webhook set to {url}")
+async def setup_webhook():
+    from httpx import AsyncClient
+    async with AsyncClient() as client:
+        response = await client.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            json={"url": f"{WEBHOOK_URL}/{TOKEN}"}
+        )
+        logger.info(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
+        logger.info(f"Webhook response: {response.text}")
+
+# ===========================
+# Start Everything
+# ===========================
 
 if __name__ == "__main__":
-    asyncio.run(set_webhook())
-    app.run(host="0.0.0.0", port=10000)
+    logger.info("Starting bot setup...")
+
+    asyncio.run(setup_webhook())
+    logger.info("Webhook setup complete. Launching Flask app.")
+
+    app.run(debug=False, host="0.0.0.0", port=10000)
