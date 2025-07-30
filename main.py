@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from flask import Flask, request
 from dotenv import load_dotenv
 from telegram import Update
@@ -55,7 +56,8 @@ def index():
 async def webhook():
     try:
         data = request.get_data()
-        update = Update.de_json(data.decode("utf-8"), application.bot)
+        json_data = json.loads(data.decode("utf-8"))
+        update = Update.de_json(json_data, application.bot)
         logger.info(f"Incoming update: {update.to_dict()}")
         await application.initialize()
         await application.process_update(update)
