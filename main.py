@@ -1,13 +1,10 @@
 import os
-import logging
 import json
+import logging
 from flask import Flask, request
-from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes,
-)
-import asyncio
+from telegram.ext import Application, CommandHandler, ContextTypes
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
@@ -64,7 +61,7 @@ async def webhook():
     except Exception as e:
         logger.exception("Webhook error:")
     return "", 200
-    
+
 # ===========================
 # Setup Webhook Before Launch
 # ===========================
@@ -84,6 +81,7 @@ async def setup_webhook():
 # ===========================
 
 if __name__ == "__main__":
+    import asyncio
     logger.info("Starting bot setup...")
 
     asyncio.run(setup_webhook())
