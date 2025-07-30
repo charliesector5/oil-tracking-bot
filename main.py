@@ -1,90 +1,86 @@
 import os
-import json
 import logging
+from datetime import datetime
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from dotenv import load_dotenv
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, ContextTypes, Dispatcher
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
 
-# Load environment
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# Flask setup
+app = Flask(__name__)
 
-# Logging setup
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Google Sheet setup
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_name("phonic-command-467516-c9-3beb65d71ac7.json", scope)
+# Telegram bot setup
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+
+# Google credentials from Render ENV variables
+google_creds = {
+    "type": os.environ.get("GDRIVE_TYPE"),
+    "project_id": os.environ.get("GDRIVE_PROJECT_ID"),
+    "private_key_id": os.environ.get("GDRIVE_PRIVATE_KEY_ID"),
+    "private_key": os.environ.get("GDRIVE_PRIVATE_KEY").replace("\\n", "\n"),
+    "client_email": os.environ.get("GDRIVE_CLIENT_EMAIL"),
+    "client_id": os.environ.get("GDRIVE_CLIENT_ID"),
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{os.environ.get('GDRIVE_CLIENT_EMAIL')}"
+}
+
+# Google Sheets auth
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+credentials = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
 gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(SHEET_ID).sheet1  # Assumes the first tab
+sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1  # Use the first sheet
 
-# Flask app
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+# Telegram Bot App
+bot = Bot(token=BOT_TOKEN)
+application = Application.builder().token(BOT_TOKEN).build()
 
-# ===========================
-# Telegram Handlers
-# ===========================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"/start from {update.effective_user.id}")
-    await update.message.reply_text("Welcome to OIL Tracker Bot!")
-
+# /clockoff handler
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"/clockoff from {user.id}")
-    
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    new_row = [
-        now.strftime("%Y-%m-%d"),
-        user.id,
-        f"{user.first_name} {user.last_name or ''}".strip(),
-        "Clock Off",
-        "",  # Current number of off (to be filled manually)
-        "+1",  # Add/Subtract
-        "",  # Final number of off (to be filled manually)
-        "",  # Approved by
-        "",  # Remarks
-        timestamp,
+    row = [
+        datetime.now().strftime('%Y-%m-%d'),  # Date
+        user.id,                              # Telegram ID
+        user.full_name,                       # Name
+        "Clock Off",                          # Action
+        "", "", "", "",                       # Current Off, +/- Off, Final Off, Approved By
+        "",                                   # Remarks
+        timestamp                             # Timestamp
     ]
-    
-    try:
-        sheet.append_row(new_row)
-        await update.message.reply_text("Clocked off successfully.")
-    except Exception as e:
-        logger.exception("Failed to log to Google Sheet.")
-        await update.message.reply_text("Failed to log your clock-off. Try again later.")
 
-# Register handlers
-application.add_handler(CommandHandler("start", start))
+    try:
+        sheet.append_row(row)
+        await update.message.reply_text("✅ Clock off recorded successfully.")
+        logger.info(f"Clock off recorded for {user.full_name} ({user.id})")
+    except Exception as e:
+        logger.error(f"Error writing to Google Sheet: {e}")
+        await update.message.reply_text("❌ Failed to log clock off. Please try again later.")
+
+# Add handlers
 application.add_handler(CommandHandler("clockoff", clockoff))
 
-# Flask routes
-@app.route("/")
-def index():
-    logger.info("Health check")
-    return "OIL Bot is running", 200
-
-@app.route(f"/{TOKEN}", methods=["POST"])
+# Webhook route
+@app.route("/", methods=["POST"])
 def webhook():
-    try:
-        data = json.loads(request.data)
-        update = Update.de_json(data, application.bot)
-        logger.info(f"Incoming update: {update.to_dict()}")
-        application.update_queue.put_nowait(update)
-    except Exception as e:
-        logger.exception("Webhook error")
-    return "", 200
+    update = Update.de_json(request.get_json(force=True), bot)
+    application.update_queue.put(update)
+    return "OK"
+
+# Webhook setup route (only run once if needed)
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook():
+    bot.set_webhook(url=WEBHOOK_URL)
+    return f"Webhook set to {WEBHOOK_URL}"
 
 if __name__ == "__main__":
-    logger.info("Starting Flask app")
-    app.run(debug=False, host="0.0.0.0", port=10000)
+    app.run(port=5000)
