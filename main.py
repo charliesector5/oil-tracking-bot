@@ -1,23 +1,21 @@
 import os
 import logging
-import asyncio
-from flask import Flask, request, abort
+from datetime import datetime
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    ApplicationBuilder,
 )
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# --- Flask App ---
-flask_app = Flask(__name__)
 
 # --- Google Sheets Setup ---
 SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -29,15 +27,12 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, S
 client = gspread.authorize(creds)
 sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# --- Telegram Setup ---
+# --- Environment Variables ---
 TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g., https://oil-tracking-bot.onrender.com
 PORT = int(os.environ.get("PORT", 10000))
 
-application = Application.builder().token(TOKEN).build()
-event_loop = asyncio.get_event_loop()
-
-# --- Bot Commands ---
+# --- Bot Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome to the OIL Tracker Bot!")
 
@@ -50,37 +45,41 @@ async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet.append_row([now, telegram_id, name, "Clock Off", "", "", "", "", "Via Bot", now])
     await update.message.reply_text("Clocked off successfully!")
 
-# --- Register Handlers ---
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("clockoff", clockoff))
+# --- Main App Setup ---
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-# --- Flask Routes ---
-@flask_app.route("/")
-def index():
-    logger.info("Health check ping received at /")
-    return "OK", 200
+    # Register commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clockoff", clockoff))
 
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-def telegram_webhook():
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), application.bot)
+    # Set webhook
+    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
 
-        # Schedule async task on the event loop
-        event_loop.call_soon_threadsafe(asyncio.create_task, application.process_update(update))
+    # Start aiohttp webhook server
+    async def handle(request):
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+        return web.Response()
 
-        return "OK", 200
-    else:
-        abort(405)
+    aio_app = web.Application()
+    aio_app.router.add_post(f'/{TOKEN}', handle)
+    aio_app.router.add_get("/", lambda request: web.Response(text="OK"))
 
-# --- Startup Async Function ---
-async def setup_bot():
-    logger.info("Starting bot...")
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    logger.info("Webhook set")
+    logger.info("Starting aiohttp server...")
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-# --- Entrypoint ---
+    logger.info("Bot is live at port %s", PORT)
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()  # optional fallback
+    await app.updater.wait()
+
 if __name__ == "__main__":
-    event_loop.run_until_complete(setup_bot())
-    flask_app.run(host="0.0.0.0", port=PORT)
+    import asyncio
+    asyncio.run(main())
