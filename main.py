@@ -1,80 +1,94 @@
 import os
 import logging
-import datetime
+import asyncio
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from datetime import datetime
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Google Sheets Setup
-SCOPES = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = '/etc/secrets/credentials.json'
-creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
-client = gspread.authorize(creds)
-sheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1L78iuAV5Z00mWzmqCo4Mtcax25cqqkMEcRBTnQWx_qQ/edit").sheet1
-
-# Telegram Bot Token
+# === Telegram Bot Token ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Command Handlers
+# === Google Sheets Setup ===
+SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
+SPREADSHEET_NAME = "OIL Tracker"
+worksheet_name = "Sheet1"
+
+# Authorize Google Sheets
+creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+client = gspread.authorize(creds)
+sheet = client.open(SPREADSHEET_NAME).worksheet(worksheet_name)
+
+# === Flask app for health checks ===
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def index():
+    logger.info("Health check ping received at /")
+    return "OK", 200
+
+# === Telegram Handlers ===
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info("/start from user: %s", user.id)
-    await update.message.reply_text("Welcome! Use /clockoff to clock your Off-in-Lieu.")
+    logger.info(f"/start triggered by {user.full_name} ({user.id})")
+    await update.message.reply_text("Welcome to the OIL bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    now = datetime.datetime.now().isoformat()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [
+        datetime.now().strftime("%Y-%m-%d"),
+        str(user.id),
+        user.full_name,
+        "Clock Off",
+        "", "", "", "",  # placeholders for balance tracking
+        "Clocked off via bot",
+        now
+    ]
+    sheet.append_row(row)
+    logger.info(f"Clock off recorded for {user.full_name} ({user.id}) at {now}")
+    await update.message.reply_text("Your clock off has been recorded!")
 
-    try:
-        row = [
-            datetime.datetime.now().strftime("%Y-%m-%d"),
-            user.id,
-            user.full_name,
-            "Clocked Off",
-            "", "", "", "", "",
-            now
-        ]
-        sheet.append_row(row)
-        logger.info("/clockoff by %s (%s) at %s", user.id, user.username, now)
-        await update.message.reply_text("Clocked off successfully.")
-    except Exception as e:
-        logger.error("Failed to log clock off: %s", e)
-        await update.message.reply_text("Something went wrong while logging your clock off.")
+# === Main async application ===
 
-# Main Entrypoint
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set")
-        return
+async def main():
+    # Hardcoded webhook URL (change if needed)
+    webhook_url = f"https://your-service-name.onrender.com/{BOT_TOKEN}"
 
-    render_url = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if not render_url:
-        logger.error("RENDER_EXTERNAL_HOSTNAME not set")
-        return
+    # Init Telegram app
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    webhook_url = f"https://{render_url}/{BOT_TOKEN}"
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+    # Add command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clockoff", clockoff))
 
-    # Set webhook before starting server
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(app.bot.set_webhook(url=webhook_url))
-
     logger.info("Bot started.")
 
-    app.run_webhook(
+    # Start the webhook server
+    await app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 10000)),
-        url_path=BOT_TOKEN
+        webhook_url=webhook_url,
+        allowed_updates=Update.ALL_TYPES,
     )
 
+# Entry point
 if __name__ == "__main__":
-    main()
+    try:
+        import threading
+        threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=8080)).start()
+        asyncio.run(main())
+    except Exception as e:
+        logger.exception("An error occurred while running the bot:")
