@@ -1,86 +1,89 @@
-import os
 import logging
+import os
 from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
-from telegram.ext._application import Application as AppClass
-from telegram.ext._utils.webhookhandler import _WebhookHandler
-
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+import asyncio
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# --- Logging ---
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Flask App ---
-flask_app = Flask(__name__)
-
 # --- Google Sheets Setup ---
-SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
 SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
 WORKSHEET_NAME = "OIL Record"
+SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
 
-creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
-client = gspread.authorize(creds)
-sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+gc = gspread.authorize(credentials)
+worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# --- Telegram Setup ---
-TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://yourapp.onrender.com
-PORT = int(os.environ.get("PORT", 10000))
+# --- Flask Setup ---
+app = Flask(__name__)
 
-# Create Telegram Application instance
-application: AppClass = Application.builder().token(TOKEN).build()
+# --- Telegram Bot Setup ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-render-url.onrender.com/<BOT_TOKEN>
 
-# --- Bot Commands ---
+application = Application.builder().token(BOT_TOKEN).build()
+
+# --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome to the OIL Tracker Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    name = user.full_name
-    telegram_id = user.id
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        user = update.effective_user
+        name = user.full_name
+        telegram_id = user.id
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    sheet.append_row([now, telegram_id, name, "Clock Off", "", "", "", "", "Via Bot", now])
-    await update.message.reply_text("Clocked off successfully!")
+        worksheet.append_row([
+            datetime.now().strftime("%d-%m-%Y"),  # Date
+            str(telegram_id),                    # Telegram ID
+            name,                                # Name
+            "Clock Off",                         # Action
+            "", "", "", "",                      # Placeholders for Off info
+            "",                                  # Approved by
+            "",                                  # Remarks
+            timestamp                            # Timestamp
+        ])
+        await update.message.reply_text("✅ Clock-off recorded successfully!")
+    except Exception as e:
+        logger.exception("Error during /clockoff")
+        await update.message.reply_text("❌ Failed to record clock-off.")
 
-# Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clockoff", clockoff))
 
-# --- Webhook Endpoint ---
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
+# --- Flask Webhook Route ---
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     try:
-        update_data = request.get_json(force=True)
-        update = Update.de_json(update_data, application.bot)
-        application.process_update(update)  # Synchronous update processing
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        asyncio.run(application.process_update(update))
     except Exception as e:
-        logger.error(f"Webhook processing error: {e}")
-        return "ERROR", 500
-    return "OK", 200
+        logger.exception("Error processing update:")
+    return "OK"
 
-# Health check
-@flask_app.route("/")
-def index():
+@app.route("/", methods=["HEAD", "GET"])
+def health_check():
     logger.info("Health check ping received at /")
-    return "Bot is running", 200
+    return "OK"
 
-# --- Webhook Setup (Run Once) ---
-async def set_webhook():
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    logger.info("Webhook has been set.")
-
-# --- Entrypoint ---
+# --- Start Bot + Webhook ---
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(set_webhook())
-
-    # Start Flask app with Gunicorn
-    flask_app.run(host="0.0.0.0", port=PORT)
+    logger.info("Starting bot...")
+    import threading
+    def run_app():
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000)),
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        )
+    threading.Thread(target=run_app).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
