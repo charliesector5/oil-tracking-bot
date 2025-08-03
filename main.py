@@ -3,75 +3,66 @@ import logging
 import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import telegram
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Logging setup
+# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Telegram Bot Token
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-# Google Sheets setup
+# Load Google credentials
 SCOPES = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = '/etc/secrets/service_account.json'
+SERVICE_ACCOUNT_FILE = '/etc/secrets/credentials.json'
 
 creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
 client = gspread.authorize(creds)
+sheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1L78iuAV5Z00mWzmqCo4Mtcax25cqqkMEcRBTnQWx_qQ/edit").sheet1
 
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+# Telegram bot token (stored as environment variable on Render)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Flask app setup
-app = Flask(__name__)
-
-# Telegram bot application
-application = Application.builder().token(BOT_TOKEN).build()
-
-# Telegram command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"/start from user: {user.id}")
-    await update.message.reply_text(f"Hello {user.first_name}, welcome to the Off Tracking Bot!")
+    logger.info("/start from user: %s", user.id)
+    await update.message.reply_text("Welcome! Use /clockoff to clock your Off-in-Lieu.")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     now = datetime.datetime.now().isoformat()
-    name = f"{user.first_name} {user.last_name or ''}".strip()
-    logger.info(f"/clockoff by {user.id} ({user.username}) at {now}")
 
+    # Log details to Google Sheets
     try:
-        sheet.append_row([
-            datetime.datetime.now().strftime('%Y-%m-%d'),
-            str(user.id),
-            name,
-            "Clock Off",
-            "",  # Current off balance
-            "",  # Add/Subtract
-            "",  # Final off balance
-            "",  # Approved by
-            "",  # Remarks
+        row = [
+            datetime.datetime.now().strftime("%Y-%m-%d"),
+            user.id,
+            user.full_name,
+            "Clocked Off",
+            "", "", "", "", "",
             now
-        ])
+        ]
+        sheet.append_row(row)
+        logger.info("/clockoff by %s (%s) at %s", user.id, user.username, now)
         await update.message.reply_text("Clocked off successfully.")
     except Exception as e:
-        logger.error(f"Error writing to sheet: {e}")
-        await update.message.reply_text("An error occurred while logging. Please try again.")
+        logger.error("Failed to append to sheet: %s", e)
+        await update.message.reply_text("An error occurred while logging your clock off.")
 
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("clockoff", clockoff))
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set in environment.")
+        return
 
-# Webhook route
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-async def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return "ok"
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clockoff", clockoff))
 
-# Webhook startup
+    logger.info("Bot started.")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_path=f"/{BOT_TOKEN}",
+        webhook_url=f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{BOT_TOKEN}",
+    )
+
 if __name__ == "__main__":
-    application.run_polling()
+    main()
