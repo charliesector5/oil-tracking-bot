@@ -1,56 +1,55 @@
 import os
-import asyncio
 import logging
 from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import pytz
 
-# Setup
-load_dotenv()
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME")
-TIMEZONE = pytz.timezone("Asia/Singapore")
+TOKEN = os.getenv("BOT_TOKEN")
+SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
+WORKSHEET_NAME = "OIL Record"
 
-# Google Sheets Auth
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/credentials.json", scope)
+# Flask app
+app = Flask(__name__)
+
+# Google Sheets Setup
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+creds = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
 gc = gspread.authorize(creds)
 worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# Telegram Bot App
-app = Flask(__name__)
-bot = Bot(token=TOKEN)
-application = ApplicationBuilder().token(TOKEN).build()
+# Telegram Application
+application = Application.builder().token(TOKEN).build()
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="OIL Bot is live.")
+    await update.message.reply_text("Bot is alive!")
 
 application.add_handler(CommandHandler("start", start))
 
+# Webhook route
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run(application.process_update(update))
-    return "ok"
+def webhook() -> str:
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "OK", 200
 
 @app.route("/", methods=["HEAD", "GET"])
-def health():
+def index():
     logger.info("Health check ping received at /")
-    return "ok"
+    return "Healthy", 200
+
+# Run bot polling (disabled, webhook only)
+def run_bot():
+    application.run_polling()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    import asyncio
+    asyncio.run(application.initialize())
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
