@@ -1,88 +1,79 @@
-import os
-import logging
-from datetime import datetime
 from flask import Flask, request
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import asyncio
+from google.oauth2.service_account import Credentials
+import datetime
+import os
+import logging
 
-# Logging
+# --- Flask Setup ---
+app = Flask(__name__)
+
+# --- Telegram Bot Token ---
+TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
+
+# --- Google Sheets Setup via Secret File ---
+SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+gc = gspread.authorize(creds)
+
+# --- Open the correct Google Sheet ---
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+sheet = gc.open_by_key(SHEET_ID).sheet1
+
+# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask setup
-app = Flask(__name__)
+# --- Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to the OIL Tracker Bot! Use /clockoff to log your time.")
 
-# Telegram & Google Sheet Setup
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-
-# Google credentials from ENV
-google_creds = {
-    "type": os.environ["GDRIVE_TYPE"],
-    "project_id": os.environ["GDRIVE_PROJECT_ID"],
-    "private_key_id": os.environ["GDRIVE_PRIVATE_KEY_ID"],
-    "private_key": os.environ["GDRIVE_PRIVATE_KEY"].replace("\\n", "\n"),
-    "client_email": os.environ["GDRIVE_CLIENT_EMAIL"],
-    "client_id": os.environ["GDRIVE_CLIENT_ID"],
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{os.environ['GDRIVE_CLIENT_EMAIL']}"
-}
-
-# Google Sheets setup
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
-gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
-
-# Telegram Bot setup
-bot = Bot(BOT_TOKEN)
-application = Application.builder().token(BOT_TOKEN).build()
-
-# Command: /clockoff
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     row = [
-        now.strftime("%Y-%m-%d"),    # Date
-        user.id,                     # Telegram ID
-        user.full_name,             # Name
-        "Clock Off",                # Action
-        "", "", "", "",             # Placeholder columns
-        "",                         # Remarks
-        timestamp                   # Timestamp
+        datetime.date.today().isoformat(),      # Date
+        user.id,                                # Telegram ID
+        user.full_name,                         # Name
+        "Clock Off",                            # Action
+        "", "", "",                             # Current/Change/Final Off Balances
+        "",                                     # Approved By
+        "",                                     # Remarks
+        now                                     # Timestamp
     ]
 
     try:
         sheet.append_row(row)
-        await update.message.reply_text("✅ Clock off recorded successfully.")
-        logger.info(f"Clocked off: {user.full_name} ({user.id})")
+        await update.message.reply_text("Clock off recorded successfully.")
+        logger.info(f"Clockoff recorded: {row}")
     except Exception as e:
-        await update.message.reply_text("❌ Failed to log clock off. Please try again.")
-        logger.error(f"Error writing to Google Sheet: {e}")
+        await update.message.reply_text("Failed to record clock off.")
+        logger.error(f"Error writing to sheet: {e}")
 
-# Register handler
+# --- Telegram Bot Setup ---
+application = Application.builder().token(TELEGRAM_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clockoff", clockoff))
 
-# Flask endpoint for webhook
-@app.route("/", methods=["POST"])
+# --- Webhook Handler ---
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run(application.process_update(update))
-    return "ok"
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        application.update_queue.put(update)
+        return "OK"
+    return "NOT OK"
 
-# Set webhook once
-@app.route("/set_webhook")
-def set_webhook():
-    success = bot.set_webhook(WEBHOOK_URL)
-    return f"Webhook set: {success}"
+# --- Health Check ---
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!"
 
+# --- Main Entrypoint ---
 if __name__ == "__main__":
-    app.run(port=5000)
+    application.run_polling()
