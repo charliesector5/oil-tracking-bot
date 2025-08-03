@@ -1,18 +1,16 @@
 import os
 import logging
 import asyncio
-from datetime import datetime
 from flask import Flask, request, abort
-
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
 )
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +36,7 @@ PORT = int(os.environ.get("PORT", 10000))
 
 application = Application.builder().token(TOKEN).build()
 
-# --- Telegram Bot Commands ---
+# --- Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome to the OIL Tracker Bot!")
 
@@ -51,6 +49,7 @@ async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet.append_row([now, telegram_id, name, "Clock Off", "", "", "", "", "Via Bot", now])
     await update.message.reply_text("Clocked off successfully!")
 
+# --- Register Handlers ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clockoff", clockoff))
 
@@ -64,14 +63,16 @@ def index():
 def telegram_webhook():
     try:
         update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.get_event_loop().create_task(application.process_update(update))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
         return "OK", 200
     except Exception as e:
         logger.error(f"Error processing update: {e}")
         return "Internal Server Error", 500
 
-# --- Async Bot Setup ---
-async def setup_webhook():
+# --- Startup Async Function ---
+async def setup_bot():
     logger.info("Starting bot...")
     await application.initialize()
     await application.start()
@@ -80,6 +81,5 @@ async def setup_webhook():
 
 # --- Entrypoint ---
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(setup_webhook())
+    asyncio.run(setup_bot())
     flask_app.run(host="0.0.0.0", port=PORT)
