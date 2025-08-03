@@ -1,90 +1,56 @@
-import logging
 import os
-from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 import asyncio
+import logging
+from flask import Flask, request
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from dotenv import load_dotenv
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+import pytz
 
-# --- Logging Setup ---
+# Setup
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Google Sheets Setup ---
-SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
-WORKSHEET_NAME = "OIL Record"
-SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
+# Constants
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME")
+TIMEZONE = pytz.timezone("Asia/Singapore")
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-gc = gspread.authorize(credentials)
+# Google Sheets Auth
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/credentials.json", scope)
+gc = gspread.authorize(creds)
 worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# --- Flask Setup ---
+# Telegram Bot App
 app = Flask(__name__)
+bot = Bot(token=TOKEN)
+application = ApplicationBuilder().token(TOKEN).build()
 
-# --- Telegram Bot Setup ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-service.onrender.com
-
-application = Application.builder().token(BOT_TOKEN).build()
-
-# --- Command Handlers ---
+# Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to the OIL Tracker Bot!")
-
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = update.effective_user
-        name = user.full_name
-        telegram_id = user.id
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        worksheet.append_row([
-            datetime.now().strftime("%d-%m-%Y"),  # Date
-            str(telegram_id),                    # Telegram ID
-            name,                                # Name
-            "Clock Off",                         # Action
-            "", "", "", "",                      # Placeholders for Off info
-            "",                                  # Approved by
-            "",                                  # Remarks
-            timestamp                            # Timestamp
-        ])
-        await update.message.reply_text("✅ Clock-off recorded successfully!")
-    except Exception as e:
-        logger.exception("Error during /clockoff")
-        await update.message.reply_text("❌ Failed to record clock-off.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="OIL Bot is live.")
 
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("clockoff", clockoff))
 
-# --- Flask Webhook Route ---
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.run(application.process_update(update))
-    except Exception as e:
-        logger.exception("Error processing update:")
-    return "OK"
+    update = Update.de_json(request.get_json(force=True), bot)
+    asyncio.run(application.process_update(update))
+    return "ok"
 
 @app.route("/", methods=["HEAD", "GET"])
-def health_check():
+def health():
     logger.info("Health check ping received at /")
-    return "OK"
+    return "ok"
 
-# --- Start Bot + Webhook ---
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-
-    import threading
-    def run_app():
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", 10000)),
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        )
-    threading.Thread(target=run_app).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)
