@@ -63,7 +63,7 @@ def index():
 def telegram_webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.create_task(application.update_queue.put(update))
+        application.update_queue.put_nowait(update)
         return "OK", 200
     else:
         abort(405)
@@ -75,7 +75,6 @@ async def setup_bot():
     await application.start()
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
     logger.info("Webhook set")
-    await application.updater.start_polling()  # optional fallback in case webhook fails
 
 # --- Entrypoint ---
 if __name__ == "__main__":
