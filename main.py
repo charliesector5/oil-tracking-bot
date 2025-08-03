@@ -6,27 +6,26 @@ from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Logging setup
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Google Sheets setup
+# Google Sheets Setup
 SCOPES = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = '/etc/secrets/credentials.json'
 creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1L78iuAV5Z00mWzmqCo4Mtcax25cqqkMEcRBTnQWx_qQ/edit").sheet1
 
-# Telegram bot token
+# Telegram Bot Token
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# /start command
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("/start from user: %s", user.id)
     await update.message.reply_text("Welcome! Use /clockoff to clock your Off-in-Lieu.")
 
-# /clockoff command
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     now = datetime.datetime.now().isoformat()
@@ -47,34 +46,35 @@ async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Failed to log clock off: %s", e)
         await update.message.reply_text("Something went wrong while logging your clock off.")
 
-# Main function
-async def main():
+# Main Entrypoint
+def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable not found.")
+        logger.error("BOT_TOKEN not set")
         return
+
+    render_url = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    if not render_url:
+        logger.error("RENDER_EXTERNAL_HOSTNAME not set")
+        return
+
+    webhook_url = f"https://{render_url}/{BOT_TOKEN}"
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clockoff", clockoff))
 
-    # Webhook URL setup
-    render_url = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if not render_url:
-        logger.error("RENDER_EXTERNAL_HOSTNAME not set.")
-        return
-
-    webhook_url = f"https://{render_url}/{BOT_TOKEN}"
-    await app.bot.set_webhook(url=webhook_url)
+    # Set webhook before starting server
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(app.bot.set_webhook(url=webhook_url))
 
     logger.info("Bot started.")
 
-    await app.run_webhook(
+    app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 10000)),
+        url_path=BOT_TOKEN
     )
 
-# Entry point
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
