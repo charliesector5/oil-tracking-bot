@@ -31,10 +31,11 @@ sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
 # --- Telegram Setup ---
 TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://your-app-name.onrender.com
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 PORT = int(os.environ.get("PORT", 10000))
 
 application = Application.builder().token(TOKEN).build()
+event_loop = asyncio.get_event_loop()
 
 # --- Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -63,7 +64,10 @@ def index():
 def telegram_webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.run(application.update_queue.put(update))
+
+        # Schedule async task on the event loop
+        event_loop.call_soon_threadsafe(asyncio.create_task, application.process_update(update))
+
         return "OK", 200
     else:
         abort(405)
@@ -78,5 +82,5 @@ async def setup_bot():
 
 # --- Entrypoint ---
 if __name__ == "__main__":
-    asyncio.run(setup_bot())
+    event_loop.run_until_complete(setup_bot())
     flask_app.run(host="0.0.0.0", port=PORT)
