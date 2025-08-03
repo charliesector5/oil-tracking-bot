@@ -63,7 +63,7 @@ def index():
 def telegram_webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
+        asyncio.run(application.update_queue.put(update))
         return "OK", 200
     else:
         abort(405)
@@ -78,6 +78,5 @@ async def setup_bot():
 
 # --- Entrypoint ---
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup_bot())
+    asyncio.run(setup_bot())
     flask_app.run(host="0.0.0.0", port=PORT)
