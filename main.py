@@ -1,87 +1,84 @@
-import logging
 import os
-from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+import logging
+import asyncio
+from flask import Flask, request, abort
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
-# Logging setup
+# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Spreadsheet info
-SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
-worksheet_name = "OIL Record"
-
-# Telegram config
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-# Google Sheets setup
-SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
-scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-client = gspread.authorize(credentials)
-sheet = client.open(SPREADSHEET_NAME).worksheet(worksheet_name)
-
-# Flask app for health checks
+# --- Flask App ---
 flask_app = Flask(__name__)
 
-@flask_app.route("/", methods=["GET", "HEAD"])
-def health_check():
-    logger.info("Health check ping received at /")
-    return "OK", 200
+# --- Google Sheets Setup ---
+SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
+SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
+WORKSHEET_NAME = "OIL Record"
 
-# Telegram command handlers
+creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+client = gspread.authorize(creds)
+sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
+
+# --- Telegram Setup ---
+TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://your-app-name.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
+
+application = Application.builder().token(TOKEN).build()
+
+# --- Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to the OIL Tracking Bot!")
+    await update.message.reply_text("Welcome to the OIL Tracker Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    name = user.full_name
+    telegram_id = user.id
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
-        name = user.full_name
-        telegram_id = user.id
-        values = [
-            datetime.now().strftime("%Y-%m-%d"),
-            str(telegram_id),
-            name,
-            "Clocked Off",
-            "", "", "", "",  # Add/Subtract, Current, Final, Approved By
-            "",              # Remarks
-            now              # Timestamp
-        ]
-        sheet.append_row(values)
-        await update.message.reply_text(f"Clock off recorded for {name} at {now}")
-        logger.info(f"Clock off recorded: {values}")
-    except Exception as e:
-        logger.error(f"Error during /clockoff: {e}")
-        await update.message.reply_text("Failed to record clock off. Please try again later.")
+    sheet.append_row([now, telegram_id, name, "Clock Off", "", "", "", "", "Via Bot", now])
+    await update.message.reply_text("Clocked off successfully!")
 
-# Main bot setup
+# --- Register Handlers ---
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("clockoff", clockoff))
+
+# --- Flask Routes ---
+@flask_app.route("/")
+def index():
+    logger.info("Health check ping received at /")
+    return "OK", 200
+
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        asyncio.create_task(application.update_queue.put(update))
+        return "OK", 200
+    else:
+        abort(405)
+
+# --- Startup Async Function ---
 async def setup_bot():
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clockoff", clockoff))
-
-    # Set webhook
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("Webhook set")
-
-    # Run the bot
-    await application.start()
-    await application.updater.start_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080)),
-        url_path="",
-    )
-    await application.updater.wait()
-
-if __name__ == "__main__":
-    import asyncio
     logger.info("Starting bot...")
-    asyncio.run(setup_bot())
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    logger.info("Webhook set")
+    await application.updater.start_polling()  # optional fallback in case webhook fails
+
+# --- Entrypoint ---
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(setup_bot())
+    flask_app.run(host="0.0.0.0", port=PORT)
