@@ -1,21 +1,16 @@
 import os
 import logging
-import asyncio
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, ContextTypes
 )
-from datetime import datetime
+from telegram.ext._application import Application as AppClass
+from telegram.ext._utils.webhookhandler import _WebhookHandler
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-# --- Config ---
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g., https://your-app-name.onrender.com
-PORT = int(os.environ.get("PORT", 10000))
+from datetime import datetime
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -34,10 +29,15 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, S
 client = gspread.authorize(creds)
 sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# --- Telegram App ---
-application = Application.builder().token(BOT_TOKEN).build()
+# --- Telegram Setup ---
+TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://yourapp.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
 
-# --- Telegram Commands ---
+# Create Telegram Application instance
+application: AppClass = Application.builder().token(TOKEN).build()
+
+# --- Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome to the OIL Tracker Bot!")
 
@@ -50,37 +50,37 @@ async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet.append_row([now, telegram_id, name, "Clock Off", "", "", "", "", "Via Bot", now])
     await update.message.reply_text("Clocked off successfully!")
 
-# --- Register Handlers ---
+# Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clockoff", clockoff))
 
-# --- Flask Routes ---
+# --- Webhook Endpoint ---
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    try:
+        update_data = request.get_json(force=True)
+        update = Update.de_json(update_data, application.bot)
+        application.process_update(update)  # Synchronous update processing
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        return "ERROR", 500
+    return "OK", 200
+
+# Health check
 @flask_app.route("/")
 def index():
     logger.info("Health check ping received at /")
-    return "OK", 200
+    return "Bot is running", 200
 
-@flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
-        return "OK", 200
-    except Exception as e:
-        logger.error(f"Error processing update: {e}")
-        return "Error", 500
+# --- Webhook Setup (Run Once) ---
+async def set_webhook():
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    logger.info("Webhook has been set.")
 
-# --- Async Startup ---
-async def setup():
-    logger.info("Starting bot...")
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info("Webhook set.")
-
-# --- Entry Point ---
+# --- Entrypoint ---
 if __name__ == "__main__":
-    asyncio.run(setup())
+    import asyncio
+    asyncio.run(set_webhook())
+
+    # Start Flask app with Gunicorn
     flask_app.run(host="0.0.0.0", port=PORT)
