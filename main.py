@@ -27,7 +27,7 @@ app = Flask(__name__)
 
 # --- Telegram Bot Setup ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-render-url.onrender.com/<BOT_TOKEN>
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-service.onrender.com
 
 application = Application.builder().token(BOT_TOKEN).build()
 
@@ -78,6 +78,7 @@ def health_check():
 # --- Start Bot + Webhook ---
 if __name__ == "__main__":
     logger.info("Starting bot...")
+
     import threading
     def run_app():
         application.run_webhook(
