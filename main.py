@@ -27,28 +27,26 @@ worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 # Telegram Application
 application = Application.builder().token(TOKEN).build()
 
-# Handlers
+# Command Handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot is alive!")
 
 application.add_handler(CommandHandler("start", start))
 
-# Webhook route
+# Webhook route (IMPORTANT FIX)
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook() -> str:
+def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
+    application.process_update(update)  # ← THIS LINE IS CRUCIAL
     return "OK", 200
 
+# Health check
 @app.route("/", methods=["HEAD", "GET"])
 def index():
     logger.info("Health check ping received at /")
     return "Healthy", 200
 
-# Run bot polling (disabled, webhook only)
-def run_bot():
-    application.run_polling()
-
+# Entry point
 if __name__ == "__main__":
     import asyncio
     asyncio.run(application.initialize())
