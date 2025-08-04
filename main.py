@@ -5,69 +5,72 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import asyncio
+import httpx
 
-# Logging
+# --- Logging setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Constants
+# --- Constants ---
 TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_NAME = "Sector 5 Charlie Oil Record"
 WORKSHEET_NAME = "OIL Record"
+WEBHOOK_URL = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
+PORT = int(os.getenv("PORT", 10000))
 
-# Flask app
+# --- Flask app ---
 app = Flask(__name__)
 
-# Google Sheets Setup
+# --- Google Sheets setup ---
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
 gc = gspread.authorize(creds)
 worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# Telegram Application
+# --- Telegram bot application ---
 application = Application.builder().token(TOKEN).build()
 
-# Handlers
+# --- Command handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot is alive!")
 
 application.add_handler(CommandHandler("start", start))
 
-# Webhook route
+# --- Flask route for Telegram webhook ---
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook() -> tuple[str, int]:
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
-    logger.info(f"🔔 Received update: {update}")
+    asyncio.create_task(application.process_update(update))
     return "OK", 200
 
-@app.route("/", methods=["HEAD", "GET"])
+# --- Health check route ---
+@app.route("/", methods=["GET", "HEAD"])
 def index():
     logger.info("Health check ping received at /")
     return "Healthy", 200
 
-# Run application
-if __name__ == "__main__":
-    import asyncio
-    import requests
-
-    async def run():
-        await application.initialize()
-        logger.info("🚀 Telegram application initialized.")
-
-        # Set webhook
-        webhook_url = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
-        set_webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-
-        try:
-            response = requests.post(set_webhook_url, json={"url": webhook_url})
-            if response.ok:
-                logger.info(f"✅ Webhook set successfully: {webhook_url}")
+# --- Set webhook via Telegram API ---
+async def set_webhook():
+    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    payload = {"url": WEBHOOK_URL}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload)
+            data = response.json()
+            if data.get("ok"):
+                logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
             else:
-                logger.error(f"❌ Failed to set webhook: {response.text}")
-        except Exception as e:
-            logger.exception("💥 Exception occurred while setting webhook")
+                logger.error(f"❌ Failed to set webhook: {data}")
+    except Exception as e:
+        logger.exception("💥 Exception occurred while setting webhook")
 
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+# --- Main runner ---
+async def run():
+    logger.info("🚀 Telegram application initialized.")
+    await application.initialize()
+    await set_webhook()
+    app.run(host="0.0.0.0", port=PORT)
 
+if __name__ == "__main__":
     asyncio.run(run())
