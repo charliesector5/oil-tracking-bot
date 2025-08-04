@@ -38,6 +38,7 @@ application.add_handler(CommandHandler("start", start))
 def webhook() -> tuple[str, int]:
     update = Update.de_json(request.get_json(force=True), application.bot)
     application.update_queue.put_nowait(update)
+    logger.info(f"🔔 Received update: {update}")
     return "OK", 200
 
 @app.route("/", methods=["HEAD", "GET"])
@@ -50,17 +51,23 @@ if __name__ == "__main__":
     import asyncio
     import requests
 
-    # Initialize telegram bot
-    asyncio.run(application.initialize())
+    async def run():
+        await application.initialize()
+        logger.info("🚀 Telegram application initialized.")
 
-    # Automatically set webhook
-    webhook_url = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
-    set_webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-    res = requests.post(set_webhook_url, json={"url": webhook_url})
-    if res.ok:
-        logger.info("✅ Webhook set successfully.")
-    else:
-        logger.error(f"❌ Failed to set webhook: {res.text}")
+        # Set webhook
+        webhook_url = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
+        set_webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
 
-    # Start Flask app
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+        try:
+            response = requests.post(set_webhook_url, json={"url": webhook_url})
+            if response.ok:
+                logger.info(f"✅ Webhook set successfully: {webhook_url}")
+            else:
+                logger.error(f"❌ Failed to set webhook: {response.text}")
+        except Exception as e:
+            logger.exception("💥 Exception occurred while setting webhook")
+
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+    asyncio.run(run())
