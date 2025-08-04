@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -36,19 +35,32 @@ application.add_handler(CommandHandler("start", start))
 
 # Webhook route
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
+def webhook() -> tuple[str, int]:
     update = Update.de_json(request.get_json(force=True), application.bot)
-    # Correctly run the coroutine in the current thread
-    asyncio.get_event_loop().create_task(application.process_update(update))
+    application.update_queue.put_nowait(update)
     return "OK", 200
 
-# Health check
 @app.route("/", methods=["HEAD", "GET"])
 def index():
     logger.info("Health check ping received at /")
     return "Healthy", 200
 
-# Run bot
+# Run application
 if __name__ == "__main__":
+    import asyncio
+    import requests
+
+    # Initialize telegram bot
     asyncio.run(application.initialize())
+
+    # Automatically set webhook
+    webhook_url = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
+    set_webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    res = requests.post(set_webhook_url, json={"url": webhook_url})
+    if res.ok:
+        logger.info("✅ Webhook set successfully.")
+    else:
+        logger.error(f"❌ Failed to set webhook: {res.text}")
+
+    # Start Flask app
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
