@@ -75,7 +75,7 @@ def setup_webhook():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(telegram_app.initialize())
-        loop.run_until_complete(telegram_app.start())  # <-- Critical line
+        loop.run_until_complete(telegram_app.start())  # Start dispatcher
         loop.run_until_complete(telegram_app.bot.set_webhook(url=WEBHOOK_URL))
         logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
     except Exception as e:
@@ -85,4 +85,7 @@ def setup_webhook():
 threading.Thread(target=setup_webhook).start()
 
 # ------------------- Gunicorn Entrypoint -------------------
-application = app  # Gunicorn will look for `application`
+application = app  # Gunicorn will look for this
+
+# ------------------- Keep the app alive -------------------
+asyncio.get_event_loop().run_forever()
