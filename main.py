@@ -2,85 +2,107 @@ import os
 import logging
 import asyncio
 import httpx
+import json
+import gspread
 import nest_asyncio
-from dotenv import load_dotenv
-from flask import Flask, request
 
+from flask import Flask, request
+from dotenv import load_dotenv
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
     CommandHandler,
+    ContextTypes,
 )
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-
-# Setup logging
+# --- Logging Setup ---
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables (if using .env locally)
+# --- Flask App for Webhook ---
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def index():
+    return "✅ Oil Tracking Bot is up."
+
+@flask_app.route('/health')
+def health():
+    return "✅ Health check passed."
+
+@flask_app.route(f'/{os.getenv("BOT_TOKEN")}', methods=["POST"])
+def webhook():
+    from telegram import Update
+    from telegram.ext import Application
+
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        telegram_app.update_queue.put_nowait(update)
+        return "OK"
+
+# --- Load environment variables (Render auto-populates these) ---
 load_dotenv()
 
-# Load credentials and configs
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-CREDENTIALS_PATH = "/etc/secrets/credentials.json"
+GOOGLE_CREDENTIALS_PATH = "/etc/secrets/credentials.json"  # Fixed path for secret file
+WORKSHEET_NAME = "OIL Record"  # Static unless changed manually
 
-# Initialize Flask app
-app = Flask(__name__)
+# --- Global app reference (used in webhook route) ---
+telegram_app = None
 
-# Google Sheets Setup
-def init_google_sheets():
-    logger.info("📄 Connecting to Google Sheets...")
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
-    client = gspread.authorize(creds)
-    sheet = client.open(GOOGLE_SHEET_ID).worksheet("OIL Record")
-    logger.info("✅ Google Sheets initialized and worksheet loaded.")
-    return sheet
-
-worksheet = init_google_sheets()
-
-# Telegram Bot Commands
+# --- Telegram Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to the OIL Tracking Bot!")
+    await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
-# Telegram Application Setup
+async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
+
+# --- Main async bot logic ---
 async def main():
-    logger.info("✅ Telegram token loaded: %s", bool(TELEGRAM_TOKEN))
-    logger.info("🚀 Starting Oil Tracking Bot initialization")
+    global telegram_app
 
+    logger.info("📄 Connecting to Google Sheets...")
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open(GOOGLE_SHEET_ID)
+        worksheet = sheet.worksheet(WORKSHEET_NAME)
+        logger.info("✅ Google Sheets initialized and worksheet loaded.")
+    except Exception as e:
+        logger.error(f"❌ Google Sheets initialization failed: {e}")
+        return
+
+    logger.info(f"✅ Telegram token loaded: {'Yes' if BOT_TOKEN else 'No'}")
+    logger.info("🚀 Starting Oil Tracking Bot initialization")
     logger.info("⚙️ Building Telegram Application...")
-    telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
     logger.info("🌐 Setting webhook URL...")
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-            params={"url": WEBHOOK_URL}
-        )
+    await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
 
     logger.info("✅ Bot is now listening for updates via webhook.")
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling()  # Still required for async init (but won’t use polling)
 
-# Flask endpoint for Telegram webhook
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-async def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), None)
-    await application.process_update(update)
-    return "OK"
-
-# Startup
+# --- Entry point ---
 if __name__ == "__main__":
     nest_asyncio.apply()
-    asyncio.run(main())
+
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.error(f"❌ Unhandled error: {e}")
+
+    logger.info("🟢 Starting Flask server to keep the app alive...")
+    flask_app.run(host="0.0.0.0", port=10000)
