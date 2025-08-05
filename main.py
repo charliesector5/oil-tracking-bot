@@ -1,13 +1,13 @@
 import os
 import logging
+import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import asyncio
 
-# Logging
+# Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -29,32 +29,38 @@ worksheet = gc.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 # Telegram Bot Setup
 application = Application.builder().token(TOKEN).build()
 
-# Telegram /start Command
+# Telegram /start handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot is alive and ready!")
 
 application.add_handler(CommandHandler("start", start))
 
-# Webhook Route
+# Webhook endpoint for Telegram
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook() -> tuple[str, int]:
+def telegram_webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
     application.update_queue.put_nowait(update)
     return "OK", 200
 
-# Health Check
+# Health check route
 @app.route("/", methods=["GET", "HEAD"])
-def index():
+def health_check():
     logger.info("✅ Health check ping received at /")
-    return "Healthy", 200
+    return "OK", 200
 
-# Run Flask and Telegram Webhook Setup
-if __name__ == "__main__":
-    async def run():
-        logger.info("🚀 Initializing Telegram bot and setting webhook...")
-        await application.initialize()
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+# Asynchronous webhook setup
+async def setup_webhook():
+    await application.initialize()
+    await application.bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
 
-    asyncio.run(run())
+# Run webhook setup in background
+def trigger_async_setup():
+    try:
+        asyncio.get_event_loop().run_until_complete(setup_webhook())
+    except RuntimeError:
+        # If an event loop is already running (common in some WSGI setups), use a task
+        asyncio.create_task(setup_webhook())
+
+# Kick off webhook setup when this file is imported (not __main__)
+trigger_async_setup()
