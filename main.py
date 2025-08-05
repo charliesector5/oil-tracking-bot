@@ -51,9 +51,18 @@ telegram_app.add_handler(CommandHandler("start", start))
 # ------------------- Flask Routes -------------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
-    return "OK", 200
+    try:
+        raw = request.get_json(force=True)
+        logger.info(f"📥 Incoming update: {raw}")
+
+        update = Update.de_json(raw, telegram_app.bot)
+        logger.info("📤 Putting update into bot queue...")
+        telegram_app.update_queue.put_nowait(update)
+
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"❌ Webhook handling error: {e}")
+        return "Internal Server Error", 500
 
 @app.route("/", methods=["GET", "HEAD"])
 def health():
@@ -66,11 +75,13 @@ def setup_webhook():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.start())  # <-- Critical line
         loop.run_until_complete(telegram_app.bot.set_webhook(url=WEBHOOK_URL))
         logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"❌ Failed to set webhook: {e}")
 
+# ------------------- Launch Initialization Thread -------------------
 threading.Thread(target=setup_webhook).start()
 
 # ------------------- Gunicorn Entrypoint -------------------
