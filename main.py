@@ -1,85 +1,82 @@
-import logging
 import os
+import logging
 import asyncio
-import pytz
-from datetime import datetime
-from flask import Flask, request, Response
+import nest_asyncio
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
-    CallbackContext,
+    CommandHandler,
 )
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # === Logging Configuration ===
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# === Environment Variables ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-app.onrender.com
-SHEET_NAME = os.getenv("SHEET_NAME", "Sector 5 Charlie Oil Record")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "OIL Record")
-CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/secrets/credentials.json")
-
-# === Flask App Setup ===
-flask_app = Flask(__name__)
-telegram_app = None  # will hold the telegram Application object
+# === Load Environment Variables ===
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+CREDENTIALS_PATH = "/etc/secrets/credentials.json"
 
 # === Google Sheets Setup ===
-def setup_sheets():
+def init_google_sheet():
     logger.info("📄 Connecting to Google Sheets...")
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    credentials = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
-    client = gspread.authorize(credentials)
-    sheet = client.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
     logger.info("✅ Google Sheets initialized and worksheet loaded.")
     return sheet
 
-sheet = setup_sheets()
+worksheet = init_google_sheet()
 
-# === Command Handlers ===
+# === Telegram Bot Handlers ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 /start command received from {update.effective_user.full_name}")
-    await update.message.reply_text("👋 Welcome! Oil Tracking Bot is online and ready.")
+    user = update.effective_user
+    logger.info(f"👤 /start by {user.first_name} ({user.id})")
+    await update.message.reply_text(f"Hello {user.first_name}! 👋 This is the Oil Tracking Bot.")
 
-# === Telegram Bot Setup ===
+# === Main async setup ===
 async def main():
-    global telegram_app
-    logger.info("⚙️ Building Telegram Application...")
-    telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    if not TELEGRAM_TOKEN:
+        logger.error("❌ TELEGRAM_TOKEN not set. Aborting.")
+        return
 
-    logger.info("📦 Registering command handlers...")
+    logger.info("🚀 Starting Oil Tracking Bot initialization")
+    logger.info("⚙️ Building Telegram Application...")
+
+    telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
 
-    logger.info(f"🌐 Setting webhook: {WEBHOOK_URL}")
+    logger.info("🌐 Setting webhook URL...")
+    await telegram_app.initialize()
     await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
+    await telegram_app.start()
+    logger.info("✅ Bot is now listening for updates via webhook.")
 
-# === Webhook Endpoint ===
+# === Flask App for Webhook ===
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def health_check():
+    return "OK", 200
+
 @flask_app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-async def webhook() -> Response:
+async def webhook():
     update = Update.de_json(request.get_json(force=True), bot=telegram_app.bot)
     await telegram_app.process_update(update)
-    return Response(status=200)
+    return "OK", 200
 
-# === Health Check ===
-@flask_app.route("/", methods=["GET"])
-def health():
-    return "✅ Oil Tracking Bot is running."
-
-# === Entrypoint ===
+# === Run App ===
 if __name__ == "__main__":
-    logger.info("🚀 Starting Oil Tracking Bot initialization")
-
-    # Patch for environments where event loop is already running (e.g., Render)
-    import nest_asyncio
+    logger.info(f"✅ Telegram token loaded: {'Yes' if TELEGRAM_TOKEN else 'No'}")
     nest_asyncio.apply()
-
     asyncio.run(main())
-    flask_app.run(host="0.0.0.0", port=10000)
