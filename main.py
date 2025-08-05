@@ -1,39 +1,54 @@
 import os
 import logging
 import asyncio
+import threading
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# Logging
+# ------------------- Logging -------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Constants
+# ------------------- Constants -------------------
 TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN is not set in environment variables.")
+
 WEBHOOK_URL = f"https://oil-tracking-bot.onrender.com/{TOKEN}"
 
-# Flask app
+# ------------------- Flask App -------------------
 app = Flask(__name__)
 
-# Google Sheets
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
-gc = gspread.authorize(creds)
-worksheet = gc.open("Sector 5 Charlie Oil Record").worksheet("OIL Record")
+# ------------------- Google Sheets Setup -------------------
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
 
-# Telegram Application
+try:
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        '/etc/secrets/credentials.json', scope
+    )
+    gc = gspread.authorize(creds)
+    worksheet = gc.open("Sector 5 Charlie Oil Record").worksheet("OIL Record")
+    logger.info("✅ Google Sheets initialized.")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Google Sheets: {e}")
+    worksheet = None
+
+# ------------------- Telegram Bot Setup -------------------
 telegram_app = Application.builder().token(TOKEN).build()
 
-# Handler
+# ------------------- Command Handlers -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot is alive!")
 
 telegram_app.add_handler(CommandHandler("start", start))
 
-# Webhook endpoint
+# ------------------- Flask Routes -------------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     update = Update.de_json(request.get_json(force=True), telegram_app.bot)
@@ -45,13 +60,18 @@ def health():
     logger.info("✅ Health check ping received")
     return "Healthy", 200
 
-# Initialization inside Flask start
-@app.before_first_request
-def init_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(telegram_app.initialize())
-    loop.run_until_complete(telegram_app.bot.set_webhook(url=WEBHOOK_URL))
-    logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
+# ------------------- Webhook Initialization Thread -------------------
+def setup_webhook():
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.bot.set_webhook(url=WEBHOOK_URL))
+        logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"❌ Failed to set webhook: {e}")
 
-# Expose Flask app as WSGI variable
+threading.Thread(target=setup_webhook).start()
+
+# ------------------- Gunicorn Entrypoint -------------------
+application = app  # Gunicorn will look for `application`
