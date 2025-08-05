@@ -1,8 +1,13 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
 COPY . .
 
-CMD ["gunicorn", "-b", "0.0.0.0:10000", "main:app"]
+# Run the bot directly
+CMD ["python", "main.py"]
