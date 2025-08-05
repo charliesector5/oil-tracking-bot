@@ -69,23 +69,22 @@ def health():
     logger.info("✅ Health check ping received")
     return "Healthy", 200
 
-# ------------------- Webhook Initialization Thread -------------------
-def setup_webhook():
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.initialize())
-        loop.run_until_complete(telegram_app.start())  # Start dispatcher
-        loop.run_until_complete(telegram_app.bot.set_webhook(url=WEBHOOK_URL))
+# ------------------- Webhook Setup Thread -------------------
+def run_bot():
+    async def runner():
+        await telegram_app.initialize()
+        await telegram_app.start()
+        await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
-    except Exception as e:
-        logger.error(f"❌ Failed to set webhook: {e}")
+        # This will keep the app running
+        await telegram_app.updater.start_polling()  # dummy polling to keep app alive in thread
 
-# ------------------- Launch Initialization Thread -------------------
-threading.Thread(target=setup_webhook).start()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner())
+
+# ------------------- Launch Bot Thread -------------------
+threading.Thread(target=run_bot).start()
 
 # ------------------- Gunicorn Entrypoint -------------------
-application = app  # Gunicorn will look for this
-
-# ------------------- Keep the app alive -------------------
-asyncio.get_event_loop().run_forever()
+application = app
