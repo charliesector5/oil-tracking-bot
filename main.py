@@ -1,5 +1,9 @@
 import os
 import logging
+import asyncio
+import pytz
+from datetime import datetime
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
@@ -7,63 +11,64 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # ------------------- Logging Setup -------------------
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-logger.info("🚀 Starting Oil Tracking Bot initialization")
-
-# ------------------- Environment Variables -------------------
-TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", "8080"))  # Render assigns a port
-WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = f"https://oil-tracking-bot.onrender.com{WEBHOOK_PATH}"
-
-if not TOKEN:
-    logger.error("❌ BOT_TOKEN not set in environment variables!")
-    raise RuntimeError("BOT_TOKEN not set")
 
 # ------------------- Google Sheets Setup -------------------
-worksheet = None
+logger.info("🚀 Starting Oil Tracking Bot initialization")
+
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials_path = "/etc/secrets/credentials.json"
+spreadsheet_name = "Sector 5 Charlie Oil Record"
+worksheet_name = "OIL Record"
+
 try:
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        '/etc/secrets/credentials.json', scope
-    )
-    gc = gspread.authorize(creds)
-    worksheet = gc.open("Sector 5 Charlie Oil Record").worksheet("OIL Record")
+    creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open(spreadsheet_name).worksheet(worksheet_name)
     logger.info("✅ Google Sheets initialized and worksheet loaded.")
 except Exception as e:
-    logger.exception("❌ Failed to initialize Google Sheets")
+    logger.exception("❌ Failed to initialize Google Sheets.")
+    raise
 
-# ------------------- Command Handlers -------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------- Telegram Bot Setup -------------------
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/<TOKEN>
+PORT = int(os.getenv("PORT", 10000))
+
+app = Flask(__name__)
+
+# ------------------- Telegram Command Handlers -------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    logger.info(f"📥 /start triggered by {user.full_name} ({user.id})")
-    await update.message.reply_text("✅ Bot is alive and connected!")
+    logger.info(f"📩 Received /start from {user.id} ({user.first_name})")
+    await update.message.reply_text("Hello! Oil tracking bot is up and running.")
 
 # ------------------- Main Runner -------------------
 async def main():
     logger.info("⚙️ Building Telegram Application...")
-    app = Application.builder().token(TOKEN).build()
+    telegram_app = Application.builder().token(TOKEN).build()
 
     logger.info("📦 Registering command handlers...")
-    app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("start", start))
 
     logger.info(f"🌐 Setting webhook: {WEBHOOK_URL}")
-    await app.run_webhook(
+    await telegram_app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_path=WEBHOOK_PATH,
         webhook_url=WEBHOOK_URL
     )
 
-# ------------------- Run Application -------------------
+# ------------------- Flask Healthcheck Route -------------------
+@app.route("/")
+def health_check():
+    logger.info("✅ Health check ping received")
+    return "OK", 200
+
+# ------------------- Entrypoint -------------------
 if __name__ == "__main__":
-    import asyncio
     try:
         asyncio.run(main())
     except Exception as e:
