@@ -1,108 +1,108 @@
 import os
 import logging
-import asyncio
-import httpx
-import json
+import pytz
+import datetime
 import gspread
-import nest_asyncio
-
 from flask import Flask, request
-from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- Logging Setup ---
+# Setup logging
 logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# --- Flask App for Webhook ---
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def index():
-    return "✅ Oil Tracking Bot is up."
-
-@flask_app.route('/health')
-def health():
-    return "✅ Health check passed."
-
-@flask_app.route(f'/{os.getenv("BOT_TOKEN")}', methods=["POST"])
-def webhook():
-    from telegram import Update
-    from telegram.ext import Application
-
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        telegram_app.update_queue.put_nowait(update)
-        return "OK"
-
-# --- Load environment variables (Render auto-populates these) ---
-load_dotenv()
-
+# Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-GOOGLE_CREDENTIALS_PATH = "/etc/secrets/credentials.json"  # Fixed path for secret file
-WORKSHEET_NAME = "OIL Record"  # Static unless changed manually
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "OIL Record")
+GOOGLE_CREDENTIALS_PATH = "/etc/secrets/credentials.json"
 
-# --- Global app reference (used in webhook route) ---
-telegram_app = None
-
-# --- Telegram Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
-
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
-
-# --- Main async bot logic ---
-async def main():
-    global telegram_app
-
+# Connect to Google Sheets
+def connect_google_sheet():
     logger.info("📄 Connecting to Google Sheets...")
     try:
         scope = [
             "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
+            "https://www.googleapis.com/auth/drive",
         ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            GOOGLE_CREDENTIALS_PATH, scope
+        )
         client = gspread.authorize(creds)
-        sheet = client.open(GOOGLE_SHEET_ID)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
         worksheet = sheet.worksheet(WORKSHEET_NAME)
         logger.info("✅ Google Sheets initialized and worksheet loaded.")
+        return worksheet
     except Exception as e:
         logger.error(f"❌ Google Sheets initialization failed: {e}")
-        return
+        return None
 
-    logger.info(f"✅ Telegram token loaded: {'Yes' if BOT_TOKEN else 'No'}")
-    logger.info("🚀 Starting Oil Tracking Bot initialization")
-    logger.info("⚙️ Building Telegram Application...")
+worksheet = connect_google_sheet()
 
-    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
+# Bot commands
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Welcome! Use /clockoff to log your off-time.")
 
-    logger.info("🌐 Setting webhook URL...")
-    await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
+async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    now = datetime.datetime.now(pytz.timezone("Asia/Singapore"))
 
-    logger.info("✅ Bot is now listening for updates via webhook.")
+    if worksheet:
+        try:
+            row = [
+                now.strftime("%Y-%m-%d"),
+                str(user.id),
+                user.full_name,
+                "Clock Off",
+                "", "", "", "", "",
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+            ]
+            worksheet.append_row(row)
+            await update.message.reply_text("✅ Your off-time has been logged.")
+        except Exception as e:
+            logger.error(f"❌ Error writing to Google Sheets: {e}")
+            await update.message.reply_text("❌ Failed to log off-time.")
+    else:
+        await update.message.reply_text("⚠️ Google Sheet is not available.")
 
-# --- Entry point ---
-if __name__ == "__main__":
-    nest_asyncio.apply()
+# Flask app to handle webhooks
+app = Flask(__name__)
 
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"❌ Unhandled error: {e}")
+@app.route("/", methods=["GET", "HEAD"])
+def health_check():
+    return "Bot is running!", 200
 
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.process_update(update)
+    return "OK", 200
+
+# Main entry
+async def main():
+    global application
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clockoff", clockoff))
+
+    # Set webhook
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    logger.info("🚀 Webhook has been set.")
     logger.info("🟢 Starting Flask server to keep the app alive...")
-    flask_app.run(host="0.0.0.0", port=10000)
+
+if __name__ == "__main__":
+    import nest_asyncio
+    import asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())
+    app.run(host="0.0.0.0", port=10000)
