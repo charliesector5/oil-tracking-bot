@@ -14,6 +14,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from concurrent.futures import ThreadPoolExecutor
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -43,20 +44,24 @@ def health():
 # --- Global Variables ---
 telegram_app = None
 worksheet = None
+loop = asyncio.new_event_loop()
+executor = ThreadPoolExecutor()
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        asyncio.create_task(telegram_app.process_update(update))
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         return "OK"
     return "Method Not Allowed", 405
 
 # --- Telegram Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"📩 /start received from {update.effective_user.id}")
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"📩 /clockoff received from {update.effective_user.id}")
     await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
 
 # --- Main Async App Initialization ---
@@ -76,7 +81,7 @@ async def main():
         return
 
     logger.info("⚙️ Initializing Telegram Application...")
-    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
@@ -87,11 +92,14 @@ async def main():
 # --- Entry Point ---
 if __name__ == "__main__":
     nest_asyncio.apply()
+    loop.create_task(main())
 
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"❌ Error during bot initialization: {e}")
+    # Start the async Telegram loop in a separate thread
+    def run_loop():
+        loop.run_forever()
+
+    import threading
+    threading.Thread(target=run_loop).start()
 
     logger.info("🟢 Starting Flask server to keep the app alive...")
     app.run(host="0.0.0.0", port=10000)
