@@ -12,8 +12,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -54,22 +54,20 @@ def webhook():
         return "Bot not ready", 503
 
     try:
-        update_data = request.get_json(force=True)
-        logger.info(f"📨 Incoming update: {update_data}")
-        update = Update.de_json(update_data, telegram_app.bot)
-        fut = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
-
-        def _callback(fut):
-            try:
-                fut.result()
-            except Exception as e:
-                logger.exception("❌ Exception in Telegram handler task")
-
-        fut.add_done_callback(_callback)
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
+        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        future.add_done_callback(_callback)
         return "OK"
     except Exception as e:
         logger.exception("❌ Error processing update")
         return "Internal Server Error", 500
+
+def _callback(fut):
+    try:
+        fut.result()
+    except Exception as e:
+        logger.exception("❌ Exception in Telegram handler task")
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,28 +75,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = update.effective_user
-        now = datetime.now()
-        row = [
-            now.strftime("%Y-%m-%d"),                             # Date
-            user.id,                                              # Telegram ID
-            f"{user.first_name} {user.last_name or ''}".strip(), # Name
-            "Clockoff",                                           # Action
-            "0",                                                  # Current number of off (placeholder)
-            "+1",                                                 # Add/Subtract (Clocking off adds)
-            "0",                                                  # Final number of off (placeholder)
-            "",                                                   # Approved by
-            "",                                                   # Remarks
-            now.strftime("%Y-%m-%d %H:%M:%S")                     # Timestamp
-        ]
+    user = update.effective_user
+    logger.info(f"📩 /clockoff received from {user.id} ({user.full_name})")
 
-        worksheet.append_row(row)
-        logger.info(f"📝 Logged /clockoff for {user.id} into Google Sheets.")
-        await update.message.reply_text("✅ Clock off recorded in Google Sheet.")
+    now = datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        current_data = worksheet.get_all_values()
+        user_rows = [row for row in current_data if row[1] == str(user.id)]
+
+        if user_rows:
+            last_row = user_rows[-1]
+            current_off = float(last_row[6])  # Final number of off
+        else:
+            current_off = 0.0
+
+        updated_off = current_off + 1.0
+
+        worksheet.append_row([
+            date,
+            str(user.id),
+            user.full_name,
+            "Clock Off",
+            f"{current_off:.1f}",
+            "+1",
+            f"{updated_off:.1f}",
+            "System",
+            "Clock off recorded",
+            timestamp
+        ])
+
+        await update.message.reply_text(f"✅ Clock off recorded.\n📊 You now have {updated_off:.1f} off(s).")
+        logger.info(f"✅ /clockoff recorded for {user.full_name} (Total: {updated_off})")
+
     except Exception as e:
-        logger.exception("❌ Failed to log /clockoff to Google Sheets.")
-        await update.message.reply_text("⚠️ Failed to record clock off.")
+        logger.exception("❌ Failed to record clock off")
+        await update.message.reply_text("❌ Failed to record your clock off. Please try again later.")
 
 # --- Telegram & Sheets Initialization ---
 async def init_app():
@@ -121,6 +135,9 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
+    await telegram_app.initialize()
+    logger.info("✅ Telegram Application initialized.")
+
     logger.info("🌐 Setting Telegram webhook...")
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info("🚀 Webhook has been set.")
@@ -135,7 +152,6 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=run_loop, daemon=True).start()
 
-    # Delay init to ensure loop is alive first
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
 
     logger.info("🟢 Starting Flask server to keep the app alive...")
