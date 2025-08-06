@@ -53,8 +53,20 @@ def webhook():
         return "Bot not ready", 503
 
     try:
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        update_json = request.get_json(force=True)
+        logger.info(f"📨 Incoming update: {update_json}")
+        update = Update.de_json(update_json, telegram_app.bot)
+
+        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+
+        def _callback(fut):
+            try:
+                fut.result()
+                logger.info("✅ Update processed successfully.")
+            except Exception:
+                logger.exception("❌ Exception in Telegram handler task")
+
+        future.add_done_callback(_callback)
         return "OK"
     except Exception as e:
         logger.exception("❌ Error processing update")
@@ -62,11 +74,11 @@ def webhook():
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 /start received from {update.effective_user.id}")
+    logger.info(f"📩 /start received from user: {update.effective_user.id}")
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 /clockoff received from {update.effective_user.id}")
+    logger.info(f"📩 /clockoff received from user: {update.effective_user.id}")
     await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
 
 # --- Telegram & Sheets Initialization ---
@@ -101,10 +113,9 @@ if __name__ == "__main__":
     def run_loop():
         loop.run_forever()
 
-    threading = __import__("threading")
+    import threading
     threading.Thread(target=run_loop, daemon=True).start()
 
-    # Delay init to ensure loop is alive first
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
 
     logger.info("🟢 Starting Flask server to keep the app alive...")
