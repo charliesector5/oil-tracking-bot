@@ -102,6 +102,9 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
+    logger.info("🧩 Manually initializing Application...")
+    await telegram_app.initialize()
+
     logger.info("🌐 Setting Telegram webhook...")
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info("🚀 Webhook has been set.")
