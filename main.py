@@ -1,140 +1,195 @@
 import os
 import logging
-import threading
 import asyncio
+import nest_asyncio
+import gspread
 from flask import Flask, request
 from dotenv import load_dotenv
-import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
-# Load environment variables
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# --- Load environment and credentials ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "/etc/secrets/credentials.json")
 
-# Set up logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Flask app
+# --- Flask App ---
 app = Flask(__name__)
 
-# Google Sheets setup
-logger.info("📄 Connecting to Google Sheets...")
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-credentials = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
-gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
-logger.info("✅ Google Sheets initialized and worksheet loaded.")
+@app.route('/')
+def index():
+    return "✅ Oil Tracking Bot is up."
 
-# Asyncio loop
+@app.route('/health')
+def health():
+    return "✅ Health check passed."
+
+# --- Globals ---
+telegram_app = None
+worksheet = None
 loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
+executor = ThreadPoolExecutor()
+user_state = {}  # To track ongoing conversations
 
-# Initialize Telegram bot
-telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-# Store ongoing conversations
-user_conversations = {}
-
-# /start handler
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"✅ /start triggered by {update.effective_user.id}")
-    await update.message.reply_text("👋 Hello! I'm your OIL tracking bot.")
-
-# /clockoff handler
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_conversations[user_id] = {"stage": "awaiting_days"}
-    logger.info(f"✅ /clockoff triggered by {update.effective_user.username} ({user_id})")
-    await update.message.reply_text("🕒 How many days are you clocking off? (0.5 to 3)")
-
-# Message handler
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_conversations:
-        return
-
-    data = user_conversations[user_id]
-
-    # Step 1: Get number of days
-    if data["stage"] == "awaiting_days":
-        try:
-            days = float(update.message.text)
-            if days < 0.5 or days > 3 or days % 0.5 != 0:
-                raise ValueError()
-            data["days"] = days
-            data["stage"] = "awaiting_reason"
-            await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
-        except ValueError:
-            await update.message.reply_text("❌ Please enter a valid number between 0.5 to 3 (in 0.5 steps).")
-
-    # Step 2: Get reason
-    elif data["stage"] == "awaiting_reason":
-        reason = update.message.text.strip()
-        if len(reason) > 20:
-            await update.message.reply_text("❌ Reason must be within 20 characters.")
-            return
-
-        data["reason"] = reason
-
-        # Write to Google Sheets
-        final_row = [
-            "",  # Date - optional
-            str(user_id),  # Telegram ID
-            update.effective_user.full_name,  # Name
-            "Clock Off",  # Action
-            "",  # Current Off
-            f"+{data['days']}",  # Add/Subtract
-            "",  # Final Off
-            "",  # Approved by
-            reason,  # Remarks
-            ""  # Timestamp
-        ]
-        sheet.append_row(final_row)
-        await update.message.reply_text(f"✅ Clock off of {data['days']} day(s) recorded with reason: {reason}")
-        logger.info(f"📝 Wrote row to sheet: {final_row}")
-
-        # Clear conversation
-        user_conversations.pop(user_id)
-
-# Register handlers
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("clockoff", clockoff))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-# Webhook route
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    logger.info(f"📨 Incoming update: {update.to_dict()}")
-    loop.call_soon_threadsafe(
-        asyncio.create_task,
-        telegram_app.process_update(update)
-    )
-    return "OK"
+    global telegram_app
+    if telegram_app is None:
+        logger.warning("⚠️ Telegram app not yet initialized.")
+        return "Bot not ready", 503
 
-# Health check
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    return "Bot is running."
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
+        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        future.add_done_callback(_callback)
+        return "OK"
+    except Exception as e:
+        logger.exception("❌ Error processing update")
+        return "Internal Server Error", 500
 
-# Thread for Telegram webhook
-def run_telegram():
-    async def start_bot():
-        await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-        logger.info("🌐 Webhook set.")
-    loop.run_until_complete(start_bot())
+def _callback(fut):
+    try:
+        fut.result()
+    except Exception as e:
+        logger.exception("❌ Exception in Telegram handler task")
 
-threading.Thread(target=run_telegram).start()
+# --- Telegram Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
-# Run Flask app
+async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_state[user_id] = {"action": "clockoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🕒 How many days do you want to clock off? (0.5 to 3, increments of 0.5)")
+
+async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_state[user_id] = {"action": "claimoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🧾 How many days do you want to claim off? (0.5 to 3, increments of 0.5)")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_state:
+        return  # Ignore if not in a flow
+
+    state = user_state[user_id]
+    message_text = update.message.text.strip()
+
+    if state["stage"] == "awaiting_days":
+        try:
+            days = float(message_text)
+            if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
+                raise ValueError()
+            state["days"] = days
+            state["stage"] = "awaiting_reason"
+            await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 and 3 in 0.5 steps.")
+
+    elif state["stage"] == "awaiting_reason":
+        reason = message_text[:20]
+        state["reason"] = reason
+
+        now = datetime.now()
+        date = now.strftime("%Y-%m-%d")
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        user = update.effective_user
+
+        # Get current off balance
+        try:
+            current_data = worksheet.get_all_values()
+            user_rows = [row for row in current_data if row[1] == str(user.id)]
+
+            if user_rows:
+                last_row = user_rows[-1]
+                current_off = float(last_row[6])  # Final Off
+            else:
+                current_off = 0.0
+
+            delta = state["days"]
+            action = state["action"]
+            add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
+            final_off = current_off + delta if action == "clockoff" else current_off - delta
+
+            worksheet.append_row([
+                date,
+                str(user.id),
+                user.full_name,
+                "Clock Off" if action == "clockoff" else "Claim Off",
+                f"{current_off:.1f}",
+                add_subtract,
+                f"{final_off:.1f}",
+                "System",
+                reason,
+                timestamp
+            ])
+
+            await update.message.reply_text(
+                f"✅ {action.replace('off', ' Off').title()} of {delta} day(s) recorded.\n📊 You now have {final_off:.1f} off(s)."
+            )
+            logger.info(f"📝 {action} written to sheet for {user.full_name}: {delta} day(s)")
+
+        except Exception:
+            logger.exception("❌ Failed to write to Google Sheets")
+            await update.message.reply_text("❌ Something went wrong. Try again later.")
+
+        user_state.pop(user_id)
+
+# --- Initialization ---
+async def init_app():
+    global telegram_app, worksheet
+
+    logger.info("📄 Connecting to Google Sheets...")
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = sheet.sheet1
+        logger.info("✅ Google Sheets initialized and worksheet loaded.")
+    except Exception as e:
+        logger.error(f"❌ Google Sheets init failed: {e}")
+        return
+
+    logger.info("⚙️ Initializing Telegram Application...")
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
+    telegram_app.add_handler(CommandHandler("claimoff", claimoff))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    logger.info("🚀 Webhook has been set.")
+
+# --- Run Everything ---
 if __name__ == "__main__":
+    nest_asyncio.apply()
+
+    def run_loop():
+        loop.run_forever()
+
+    import threading
+    threading.Thread(target=run_loop, daemon=True).start()
+    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
     logger.info("🟢 Starting Flask server to keep the app alive...")
     app.run(host="0.0.0.0", port=10000)
