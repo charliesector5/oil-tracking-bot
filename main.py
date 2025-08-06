@@ -6,11 +6,14 @@ import gspread
 from flask import Flask, request
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    ConversationHandler,
+    filters,
 )
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -46,6 +49,7 @@ worksheet = None
 loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 
+# --- Telegram Webhook ---
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     global telegram_app
@@ -55,64 +59,79 @@ def webhook():
 
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
-        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
-        future.add_done_callback(_callback)
+        logger.info(f"📨 Incoming update: {update.to_dict()}")
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         return "OK"
     except Exception as e:
         logger.exception("❌ Error processing update")
         return "Internal Server Error", 500
 
-def _callback(fut):
-    try:
-        fut.result()
-    except Exception as e:
-        logger.exception("❌ Exception in Telegram handler task")
+# --- Conversation States ---
+CHOOSING_DAYS, ENTERING_REASON = range(2)
 
-# --- Telegram Handlers ---
+# --- Command: /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📩 /start received from {update.effective_user.id}")
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"📩 /clockoff received from {user.id} ({user.full_name})")
+# --- Conversation: /clockoff ---
+async def clockoff_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"📩 /clockoff initiated by {update.effective_user.id}")
+    reply_keyboard = [["0.5", "1", "1.5"], ["2", "2.5", "3"]]
+    await update.message.reply_text(
+        "🕒 How many days would you like to clock off? (in increments of 0.5, max 3)",
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return CHOOSING_DAYS
 
-    now = datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+async def receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    try:
+        days = float(user_input)
+        if days not in [0.5, 1, 1.5, 2, 2.5, 3]:
+            raise ValueError
+        context.user_data["days"] = days
+        await update.message.reply_text("📝 What's the reason? (max 20 characters)", reply_markup=ReplyKeyboardRemove())
+        return ENTERING_REASON
+    except ValueError:
+        await update.message.reply_text("❌ Please enter a valid number: 0.5, 1, 1.5, 2, 2.5, or 3.")
+        return CHOOSING_DAYS
+
+async def receive_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reason = update.message.text.strip()
+    if len(reason) > 20:
+        await update.message.reply_text("❌ Reason too long. Please keep it under 20 characters.")
+        return ENTERING_REASON
+
+    user = update.effective_user
+    days = context.user_data.get("days", 0)
+
+    row = [
+        datetime.now().strftime("%Y-%m-%d"),
+        str(user.id),
+        f"{user.first_name} {user.last_name or ''}".strip(),
+        "Clock Off",
+        "",  # Current off
+        f"+{days}",  # Add/Subtract
+        "",  # Final off
+        "",  # Approved by
+        reason,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ]
 
     try:
-        current_data = worksheet.get_all_values()
-        user_rows = [row for row in current_data if row[1] == str(user.id)]
-
-        if user_rows:
-            last_row = user_rows[-1]
-            current_off = float(last_row[6])  # Final number of off
-        else:
-            current_off = 0.0
-
-        updated_off = current_off + 1.0
-
-        worksheet.append_row([
-            date,
-            str(user.id),
-            user.full_name,
-            "Clock Off",
-            f"{current_off:.1f}",
-            "+1",
-            f"{updated_off:.1f}",
-            "System",
-            "Clock off recorded",
-            timestamp
-        ])
-
-        await update.message.reply_text(f"✅ Clock off recorded.\n📊 You now have {updated_off:.1f} off(s).")
-        logger.info(f"✅ /clockoff recorded for {user.full_name} (Total: {updated_off})")
-
+        worksheet.append_row(row)
+        logger.info(f"✅ Logged clock off for {user.id} - {days} day(s) - {reason}")
+        await update.message.reply_text("✅ Your clock off has been recorded.")
     except Exception as e:
-        logger.exception("❌ Failed to record clock off")
-        await update.message.reply_text("❌ Failed to record your clock off. Please try again later.")
+        logger.exception("❌ Failed to write to Google Sheets")
+        await update.message.reply_text("❌ Failed to write to the sheet. Please try again later.")
+
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❎ Clock off cancelled.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
 # --- Telegram & Sheets Initialization ---
 async def init_app():
@@ -132,11 +151,19 @@ async def init_app():
 
     logger.info("⚙️ Initializing Telegram Application...")
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
-    await telegram_app.initialize()
-    logger.info("✅ Telegram Application initialized.")
+    # Handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("clockoff", clockoff_start)],
+        states={
+            CHOOSING_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_days)],
+            ENTERING_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    telegram_app.add_handler(conv_handler)
 
     logger.info("🌐 Setting Telegram webhook...")
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
