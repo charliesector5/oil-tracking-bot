@@ -12,6 +12,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Logging Setup ---
@@ -53,20 +54,18 @@ def webhook():
         return "Bot not ready", 503
 
     try:
-        update_json = request.get_json(force=True)
-        logger.info(f"📨 Incoming update: {update_json}")
-        update = Update.de_json(update_json, telegram_app.bot)
-
-        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        update_data = request.get_json(force=True)
+        logger.info(f"📨 Incoming update: {update_data}")
+        update = Update.de_json(update_data, telegram_app.bot)
+        fut = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
 
         def _callback(fut):
             try:
                 fut.result()
-                logger.info("✅ Update processed successfully.")
-            except Exception:
+            except Exception as e:
                 logger.exception("❌ Exception in Telegram handler task")
 
-        future.add_done_callback(_callback)
+        fut.add_done_callback(_callback)
         return "OK"
     except Exception as e:
         logger.exception("❌ Error processing update")
@@ -74,12 +73,32 @@ def webhook():
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 /start received from user: {update.effective_user.id}")
+    logger.info(f"📩 /start received from {update.effective_user.id}")
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 /clockoff received from user: {update.effective_user.id}")
-    await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
+    try:
+        user = update.effective_user
+        now = datetime.now()
+        row = [
+            now.strftime("%Y-%m-%d"),                             # Date
+            user.id,                                              # Telegram ID
+            f"{user.first_name} {user.last_name or ''}".strip(), # Name
+            "Clockoff",                                           # Action
+            "0",                                                  # Current number of off (placeholder)
+            "+1",                                                 # Add/Subtract (Clocking off adds)
+            "0",                                                  # Final number of off (placeholder)
+            "",                                                   # Approved by
+            "",                                                   # Remarks
+            now.strftime("%Y-%m-%d %H:%M:%S")                     # Timestamp
+        ]
+
+        worksheet.append_row(row)
+        logger.info(f"📝 Logged /clockoff for {user.id} into Google Sheets.")
+        await update.message.reply_text("✅ Clock off recorded in Google Sheet.")
+    except Exception as e:
+        logger.exception("❌ Failed to log /clockoff to Google Sheets.")
+        await update.message.reply_text("⚠️ Failed to record clock off.")
 
 # --- Telegram & Sheets Initialization ---
 async def init_app():
@@ -102,9 +121,6 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
 
-    logger.info("🧩 Manually initializing Application...")
-    await telegram_app.initialize()
-
     logger.info("🌐 Setting Telegram webhook...")
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info("🚀 Webhook has been set.")
@@ -119,6 +135,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=run_loop, daemon=True).start()
 
+    # Delay init to ensure loop is alive first
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
 
     logger.info("🟢 Starting Flask server to keep the app alive...")
