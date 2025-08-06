@@ -1,108 +1,74 @@
 import os
 import logging
-import pytz
-import datetime
-import gspread
+import json
+import asyncio
 from flask import Flask, request
-from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Setup logging
+# Logging config
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "OIL Record")
-GOOGLE_CREDENTIALS_PATH = "/etc/secrets/credentials.json"
-
-# Connect to Google Sheets
-def connect_google_sheet():
-    logger.info("📄 Connecting to Google Sheets...")
-    try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            GOOGLE_CREDENTIALS_PATH, scope
-        )
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID)
-        worksheet = sheet.worksheet(WORKSHEET_NAME)
-        logger.info("✅ Google Sheets initialized and worksheet loaded.")
-        return worksheet
-    except Exception as e:
-        logger.error(f"❌ Google Sheets initialization failed: {e}")
-        return None
-
-worksheet = connect_google_sheet()
-
-# Bot commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome! Use /clockoff to log your off-time.")
-
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    now = datetime.datetime.now(pytz.timezone("Asia/Singapore"))
-
-    if worksheet:
-        try:
-            row = [
-                now.strftime("%Y-%m-%d"),
-                str(user.id),
-                user.full_name,
-                "Clock Off",
-                "", "", "", "", "",
-                now.strftime("%Y-%m-%d %H:%M:%S"),
-            ]
-            worksheet.append_row(row)
-            await update.message.reply_text("✅ Your off-time has been logged.")
-        except Exception as e:
-            logger.error(f"❌ Error writing to Google Sheets: {e}")
-            await update.message.reply_text("❌ Failed to log off-time.")
-    else:
-        await update.message.reply_text("⚠️ Google Sheet is not available.")
-
-# Flask app to handle webhooks
+# Flask app
 app = Flask(__name__)
 
-@app.route("/", methods=["GET", "HEAD"])
-def health_check():
-    return "Bot is running!", 200
+# Load credentials from the mounted secret file
+SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
+with open(SERVICE_ACCOUNT_FILE, "r") as f:
+    creds_json = json.load(f)
+
+# Google Sheets API setup
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+
+try:
+    gc = gspread.authorize(credentials)
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    sh = gc.open_by_key(sheet_id)
+    worksheet = sh.get_worksheet(0)
+    logging.info("✅ Google Sheets initialized and worksheet loaded.")
+except Exception as e:
+    logging.error(f"❌ Google Sheets initialization failed: {e}")
+
+# Telegram Bot setup
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+application = Application.builder().token(BOT_TOKEN).build()
+
+async def start(update: Update, context):
+    await update.message.reply_text("Hello! This bot is up and running.")
+
+application.add_handler(CommandHandler("start", start))
+
+# Set webhook on startup
+@app.before_first_request
+def set_webhook():
+    import httpx
+    response = httpx.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+        params={"url": WEBHOOK_URL},
+    )
+    if response.status_code == 200:
+        logging.info("🚀 Webhook has been set.")
+    else:
+        logging.error(f"❌ Failed to set webhook: {response.text}")
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.process_update(update)
-    return "OK", 200
+    asyncio.create_task(application.process_update(update))
+    return "OK"
 
-# Main entry
-async def main():
-    global application
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clockoff", clockoff))
-
-    # Set webhook
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info("🚀 Webhook has been set.")
-    logger.info("🟢 Starting Flask server to keep the app alive...")
+@app.route("/", methods=["GET", "HEAD"])
+def index():
+    return "Bot is running!"
 
 if __name__ == "__main__":
-    import nest_asyncio
-    import asyncio
-    nest_asyncio.apply()
-    asyncio.run(main())
+    logging.info("🟢 Starting Flask server to keep the app alive...")
     app.run(host="0.0.0.0", port=10000)
