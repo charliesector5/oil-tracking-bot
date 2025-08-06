@@ -47,11 +47,18 @@ executor = ThreadPoolExecutor()
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    if request.method == "POST":
+    global telegram_app
+    if telegram_app is None:
+        logger.warning("⚠️ Telegram app not yet initialized.")
+        return "Bot not ready", 503
+
+    try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
         asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         return "OK"
-    return "Method Not Allowed", 405
+    except Exception as e:
+        logger.exception("❌ Error processing update")
+        return "Internal Server Error", 500
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,6 +104,8 @@ if __name__ == "__main__":
     threading = __import__("threading")
     threading.Thread(target=run_loop, daemon=True).start()
 
-    loop.create_task(init_app())
+    # Delay init to ensure loop is alive first
+    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
+
     logger.info("🟢 Starting Flask server to keep the app alive...")
     app.run(host="0.0.0.0", port=10000)
