@@ -1,8 +1,6 @@
 import os
 import logging
 import asyncio
-import json
-import httpx
 import nest_asyncio
 import gspread
 from flask import Flask, request
@@ -41,7 +39,7 @@ def index():
 def health():
     return "✅ Health check passed."
 
-# --- Global Variables ---
+# --- Globals ---
 telegram_app = None
 worksheet = None
 loop = asyncio.new_event_loop()
@@ -55,7 +53,7 @@ def webhook():
         return "OK"
     return "Method Not Allowed", 405
 
-# --- Telegram Command Handlers ---
+# --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📩 /start received from {update.effective_user.id}")
     await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
@@ -64,8 +62,8 @@ async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📩 /clockoff received from {update.effective_user.id}")
     await update.message.reply_text("⏰ Clock off recorded. (Stub logic)")
 
-# --- Main Async App Initialization ---
-async def main():
+# --- Telegram & Sheets Initialization ---
+async def init_app():
     global telegram_app, worksheet
 
     logger.info("📄 Connecting to Google Sheets...")
@@ -77,7 +75,7 @@ async def main():
         worksheet = sheet.sheet1
         logger.info("✅ Google Sheets initialized and worksheet loaded.")
     except Exception as e:
-        logger.error(f"❌ Google Sheets initialization failed: {e}")
+        logger.error(f"❌ Google Sheets init failed: {e}")
         return
 
     logger.info("⚙️ Initializing Telegram Application...")
@@ -89,17 +87,16 @@ async def main():
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info("🚀 Webhook has been set.")
 
-# --- Entry Point ---
+# --- Run Everything ---
 if __name__ == "__main__":
     nest_asyncio.apply()
-    loop.create_task(main())
 
-    # Start the async Telegram loop in a separate thread
     def run_loop():
         loop.run_forever()
 
-    import threading
-    threading.Thread(target=run_loop).start()
+    threading = __import__("threading")
+    threading.Thread(target=run_loop, daemon=True).start()
 
+    loop.create_task(init_app())
     logger.info("🟢 Starting Flask server to keep the app alive...")
     app.run(host="0.0.0.0", port=10000)
