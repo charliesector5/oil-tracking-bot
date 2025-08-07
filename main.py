@@ -160,25 +160,17 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         delta = float(state["days"])
         new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
 
-        # Confirmation in group chat
-        await context.bot.send_message(
-            chat_id=group_id,
-            text=f"📨 {user.full_name} has submitted a request for *{state['action']}* of {delta} day(s). Awaiting approval.",
-            parse_mode="Markdown"
-        )
-
         admins = await context.bot.get_chat_administrators(group_id)
         for admin in admins:
             if admin.user.is_bot:
                 continue
             try:
-                callback_id = f"{user.id}_{admin.user.id}"
                 await context.bot.send_message(
                     chat_id=admin.user.id,
                     text=(
                         f"🆕 *{state['action'].title()} Request*\n\n"
                         f"👤 User: {user.full_name} ({user.id})\n"
-                        f"📅 Days: {delta}\n"
+                        f"📅 Days: {state['days']}\n"
                         f"📝 Reason: {state['reason']}\n\n"
                         f"📊 Current Off: {current_off:.1f} day(s)\n"
                         f"📈 New Balance: {new_off:.1f} day(s)\n\n"
@@ -186,8 +178,8 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{callback_id}|{user.full_name}|{state['action']}|{delta}|{state['reason']}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{callback_id}|{user.id}")
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}_{admin.user.id}|{user.full_name}|{state['action']}|{state['days']}|{state['reason']}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}_{admin.user.id}|{user.id}")
                     ]])
                 )
             except Exception as e:
@@ -201,12 +193,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("approve|"):
-        _, _, user_id, full_name, action, days, reason = data.split("|", maxsplit=6)
-        now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        date = now.strftime("%Y-%m-%d")
-
         try:
+            _, callback_id, full_name, action, days, reason = data.split("|", maxsplit=5)
+            user_id = callback_id.split("_")[0]
+            now = datetime.now()
+            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            date = now.strftime("%Y-%m-%d")
+
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if row[1] == str(user_id)]
             current_off = float(rows[-1][6]) if rows else 0.0
@@ -228,7 +221,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
             await query.edit_message_text("✅ Request approved and recorded.")
-
             await context.bot.send_message(
                 chat_id=int(user_id),
                 text=(
@@ -240,13 +232,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except Exception:
-            logger.exception("❌ Failed to write to sheet")
+            logger.exception("❌ Failed to process approval")
             await query.edit_message_text("❌ Failed to approve request.")
 
     elif data.startswith("deny|"):
-        _, _, user_id = data.split("|", maxsplit=2)
-        await query.edit_message_text("❌ Request denied.")
-        await context.bot.send_message(chat_id=int(user_id), text="❌ Your request was denied.")
+        try:
+            _, callback_id, user_id = data.split("|", maxsplit=2)
+            await query.edit_message_text("❌ Request denied.")
+            await context.bot.send_message(chat_id=int(user_id), text="❌ Your request was denied.")
+        except Exception:
+            logger.exception("❌ Failed to process denial")
+            await query.edit_message_text("❌ Failed to deny request.")
 
 # --- Init ---
 async def init_app():
