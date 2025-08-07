@@ -50,7 +50,6 @@ worksheet = None
 loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 user_state = {}
-submission_messages = {}
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -75,7 +74,45 @@ def _callback(fut):
     except Exception:
         logger.exception("❌ Exception in handler")
 
-# --- Handlers ---
+# --- Helper Text Builders ---
+def build_admin_pm_text(user_full_name, user_id, action, days, reason, current_off):
+    delta = float(days)
+    new_balance = current_off + delta if action == "clockoff" else current_off - delta
+    return (
+        f"🆕 *{action.title()} Request*\n\n"
+        f"👤 User: {user_full_name} ({user_id})\n"
+        f"📅 Days: {days}\n"
+        f"📝 Reason: {reason}\n\n"
+        f"📊 Current Off: {current_off:.1f} day(s)\n"
+        f"📈 New Balance: {new_balance:.1f} day(s)\n\n"
+        "✅ Approve or ❌ Deny?"
+    )
+
+def build_user_group_confirmation(action, days, reason):
+    action_text = "Clock Off" if action == "clockoff" else "Claim Off"
+    return (
+        f"📝 Your *{action_text}* request for {days} day(s) has been submitted.\n"
+        f"Reason: {reason}\n\n"
+        "⏳ Awaiting admin approval..."
+    )
+
+def build_user_final_response(action, days, reason, final_balance, approved=True):
+    action_text = "Clock Off" if action == "clockoff" else "Claim Off"
+    if approved:
+        return (
+            f"✅ Your *{action_text}* request has been approved!\n\n"
+            f"📅 Days: {days}\n"
+            f"📝 Reason: {reason}\n"
+            f"📊 New Balance: {final_balance:.1f} day(s)"
+        )
+    else:
+        return (
+            f"❌ Your *{action_text}* request was rejected.\n\n"
+            f"📅 Days: {days}\n"
+            f"📝 Reason: {reason}"
+        )
+
+# --- Commands ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛠️ *Oil Tracking Bot Help*\n\n"
@@ -148,22 +185,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state["stage"] == "awaiting_reason":
         reason = message[:20]
         state["reason"] = reason
-        sent = await update.message.reply_text("📩 Request submitted for approval.")
-        submission_messages[user_id] = sent.message_id
+        await update.message.reply_text("📩 Your request has been submitted for approval.")
         await send_approval_request(update, context, state)
         user_state.pop(user_id)
 
 async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
     user = update.effective_user
     group_id = update.message.chat.id
-
-    all_data = worksheet.get_all_values()
-    user_rows = [row for row in all_data if row[1] == str(user.id)]
-    current_off = float(user_rows[-1][6]) if user_rows else 0.0
-    delta = float(state["days"])
-    final = current_off + delta if state["action"] == "clockoff" else current_off - delta
-
     try:
+        all_data = worksheet.get_all_values()
+        user_rows = [row for row in all_data if row[1] == str(user.id)]
+        current_off = float(user_rows[-1][6]) if user_rows else 0.0
+
+        # Confirm submission in group
+        await context.bot.send_message(
+            chat_id=group_id,
+            text=build_user_group_confirmation(state['action'], state['days'], state['reason']),
+            parse_mode="Markdown"
+        )
+
         admins = await context.bot.get_chat_administrators(group_id)
         for admin in admins:
             if admin.user.is_bot:
@@ -171,24 +211,17 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await context.bot.send_message(
                     chat_id=admin.user.id,
-                    text=(
-                        f"🆕 *{state['action'].title()} Request*\n\n"
-                        f"👤 User: {user.full_name} ({user.id})\n"
-                        f"📅 Days: {state['days']}\n"
-                        f"📝 Reason: {state['reason']}\n"
-                        f"📊 Current: {current_off:.1f} → After: {final:.1f}\n\n"
-                        "✅ Approve or ❌ Deny?"
-                    ),
+                    text=build_admin_pm_text(user.full_name, user.id, state['action'], state['days'], state['reason'], current_off),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{user.full_name}|{group_id}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{group_id}")
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{user.full_name}|{state['action']}|{state['days']}|{state['reason']}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['action']}|{state['days']}|{state['reason']}")
                     ]])
                 )
             except Exception as e:
                 logger.warning(f"⚠️ Cannot PM admin {admin.user.id}: {e}")
     except Exception:
-        logger.exception("❌ Failed to notify admins")
+        logger.exception("❌ Failed to fetch or notify admins")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -196,23 +229,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("approve|"):
-        _, user_id, action, days, reason, name, group_id = data.split("|")
+        _, user_id, full_name, action, days, reason = data.split("|")
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         date = now.strftime("%Y-%m-%d")
 
-        all_data = worksheet.get_all_values()
-        rows = [row for row in all_data if row[1] == str(user_id)]
-        current_off = float(rows[-1][6]) if rows else 0.0
-        delta = float(days)
-        final = current_off + delta if action == "clockoff" else current_off - delta
-        add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
-
         try:
+            all_data = worksheet.get_all_values()
+            rows = [row for row in all_data if row[1] == str(user_id)]
+            current_off = float(rows[-1][6]) if rows else 0.0
+            delta = float(days)
+            final = current_off + delta if action == "clockoff" else current_off - delta
+            add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
+
             worksheet.append_row([
                 date,
-                user_id,
-                name,
+                str(user_id),
+                full_name,
                 "Clock Off" if action == "clockoff" else "Claim Off",
                 f"{current_off:.1f}",
                 add_subtract,
@@ -221,23 +254,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reason,
                 timestamp
             ])
+
             await query.edit_message_text("✅ Request approved and recorded.")
             await context.bot.send_message(
                 chat_id=int(user_id),
-                text=f"✅ Your {action} request for {delta} day(s) was approved.\nNew balance: {final:.1f} day(s)."
+                text=build_user_final_response(action, days, reason, final, approved=True),
+                parse_mode="Markdown"
             )
-            if int(user_id) in submission_messages:
-                await context.bot.delete_message(chat_id=int(group_id), message_id=submission_messages[int(user_id)])
         except Exception:
             logger.exception("❌ Failed to write to sheet")
             await query.edit_message_text("❌ Failed to approve request.")
 
     elif data.startswith("deny|"):
-        _, user_id, group_id = data.split("|")
+        _, user_id, action, days, reason = data.split("|")
         await query.edit_message_text("❌ Request denied.")
-        await context.bot.send_message(chat_id=int(user_id), text="❌ Your request was rejected.")
-        if int(user_id) in submission_messages:
-            await context.bot.delete_message(chat_id=int(group_id), message_id=submission_messages[int(user_id)])
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=build_user_final_response(action, days, reason, 0.0, approved=False),
+            parse_mode="Markdown"
+        )
 
 # --- Init ---
 async def init_app():
