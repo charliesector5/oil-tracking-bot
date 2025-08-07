@@ -46,6 +46,7 @@ def health():
 # --- Globals ---
 telegram_app = None
 worksheet = None
+loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 user_state = {}
 admin_message_refs = {}
@@ -60,7 +61,7 @@ def webhook():
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
         logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
-        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.loop)
+        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         future.add_done_callback(_callback)
         return "OK"
     except Exception:
@@ -138,19 +139,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
                 raise ValueError()
             state["days"] = days
-            state["stage"] = "awaiting_date"
-            await update.message.reply_text("📅 Please enter the Application Date (YYYY-MM-DD):")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
-
-    elif state["stage"] == "awaiting_date":
-        try:
-            datetime.strptime(message, "%Y-%m-%d")
-            state["date"] = message
             state["stage"] = "awaiting_reason"
             await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
         except ValueError:
-            await update.message.reply_text("❌ Invalid date format. Use YYYY-MM-DD.")
+            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
 
     elif state["stage"] == "awaiting_reason":
         reason = message[:20]
@@ -183,7 +175,6 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                         f"🆕 *{state['action'].title()} Request*\n\n"
                         f"👤 User: {user.full_name} ({user.id})\n"
                         f"📅 Days: {state['days']}\n"
-                        f"📆 Application Date: {state['date']}\n"
                         f"📝 Reason: {state['reason']}\n\n"
                         f"📊 Current Off: {current_off:.1f} day(s)\n"
                         f"📈 New Balance: {new_off:.1f} day(s)\n\n"
@@ -191,7 +182,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{state['date']}|{group_id}"),
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{group_id}"),
                         InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['reason']}|{group_id}")
                     ]])
                 )
@@ -208,9 +199,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if data.startswith("approve|"):
-            _, user_id, action, days, reason, app_date, group_id = data.split("|")
+            _, user_id, action, days, reason, group_id = data.split("|")
             now = datetime.now()
             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            date = now.strftime("%Y-%m-%d")
 
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if row[1] == str(user_id)]
@@ -220,15 +212,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
 
             worksheet.append_row([
-                now.strftime("%Y-%m-%d"), str(user_id), "", action.title().replace("off", " Off"),
+                date, str(user_id), "", action.title().replace("off", " Off"),
                 f"{current_off:.1f}", add_subtract, f"{final:.1f}",
-                query.from_user.full_name, app_date, reason, timestamp
+                query.from_user.full_name, reason, timestamp
             ])
 
             await query.edit_message_text("✅ Request approved and recorded.")
             await context.bot.send_message(
                 chat_id=int(group_id),
-                text=f"✅ {user_id}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📆 Application Date: {app_date}\n📊 Final: {final:.1f} day(s)"
+                text=f"✅ {user_id}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📊 Final: {final:.1f} day(s)"
             )
 
         elif data.startswith("deny|"):
@@ -239,6 +231,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"❌ {user_id}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
             )
 
+        # Clean up all admin messages
         if user_id in admin_message_refs:
             for admin_id, msg_id in admin_message_refs[user_id]:
                 if admin_id != query.from_user.id:
@@ -283,5 +276,8 @@ async def init_app():
 # --- Run ---
 if __name__ == "__main__":
     nest_asyncio.apply()
-    asyncio.run(init_app())
+    import threading
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
+    logger.info("🟢 Starting Flask...")
     app.run(host="0.0.0.0", port=10000)
