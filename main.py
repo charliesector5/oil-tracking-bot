@@ -153,13 +153,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
     user = update.effective_user
-    group_id = update.message.chat.id
+    group_id = GROUP_CHAT_ID
     try:
         all_data = worksheet.get_all_values()
         user_rows = [row for row in all_data if row[1] == str(user.id)]
         current_off = float(user_rows[-1][6]) if user_rows else 0.0
         delta = float(state["days"])
         new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
+
+        await context.bot.send_message(
+            chat_id=group_id,
+            text=(
+                f"📨 *{state['action'].title()} Request Submitted*\n\n"
+                f"👤 User: {user.full_name} ({user.id})\n"
+                f"📅 Days: {state['days']}\n"
+                f"📝 Reason: {state['reason']}"
+            ),
+            parse_mode="Markdown"
+        )
 
         admins = await context.bot.get_chat_administrators(group_id)
         for admin in admins:
@@ -188,6 +199,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("❌ Failed to fetch or notify admins")
 
+# --- rest of the code remains unchanged ---
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
