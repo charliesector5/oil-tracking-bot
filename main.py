@@ -22,7 +22,7 @@ import nest_asyncio
 # --- Load environment variables ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # fallback default
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 # --- Flask app ---
@@ -76,11 +76,18 @@ async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- OIL Request Flow ---
 async def handle_oil_request(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str = "Clock Off"):
     user = update.effective_user
+    chat_type = update.effective_chat.type
     chat_id = update.effective_chat.id
+
+    print(f"[DEBUG] Received request in chat type: {chat_type}, ID: {chat_id}")
+
+    if chat_type == "private":
+        print(f"[WARN] Fallback to .env GROUP_CHAT_ID")
+        chat_id = int(os.getenv("GROUP_CHAT_ID"))
+
     days = "1.0"
     reason = "Project"
 
-    # Save user request state
     user_state[user.id] = {
         "full_name": user.full_name,
         "action": action,
@@ -128,7 +135,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if parts[0] == "approve":
         user_id, full_name, action, days, reason, group_chat_id = parts[1:]
-        group_chat_id = int(group_chat_id)
+        try:
+            group_chat_id = int(group_chat_id)
+        except ValueError:
+            print(f"[ERROR] Invalid group_chat_id: {group_chat_id}")
+            group_chat_id = int(os.getenv("GROUP_CHAT_ID"))
+
         request_id = f"{user_id}|{action}|{days}|{reason}"
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -139,17 +151,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         worksheet.append_row(row)
 
-        # Notify group chat
-        await context.bot.send_message(
-            chat_id=group_chat_id,
-            text=(
-                f"✅ {full_name}'s {action} approved!\n"
-                f"📅 Days: {days}\n"
-                f"📝 Reason: {reason}"
-            )
-        )
+        print(f"[DEBUG] Sending group approval to chat_id={group_chat_id}")
 
-        # Update all other admin messages
+        try:
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=(
+                    f"✅ {full_name}'s {action} approved!\n"
+                    f"📅 Days: {days}\n"
+                    f"📝 Reason: {reason}"
+                )
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to send group notification: {e}")
+            fallback_id = int(os.getenv("GROUP_CHAT_ID"))
+            await context.bot.send_message(
+                chat_id=fallback_id,
+                text=(
+                    f"⚠️ Could not send to original group chat.\n"
+                    f"✅ {full_name}'s {action} approved.\n"
+                    f"📝 Reason: {reason}"
+                )
+            )
+
+        # Clean up other admin messages
         for record in context.bot_data["pending_requests"].get(request_id, []):
             if record["admin_id"] != query.from_user.id:
                 try:
@@ -157,34 +182,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=record["admin_id"],
                         message_id=record["message_id"],
                         text=(
-                            f"✅ {full_name}'s {action} for '{reason}' "
-                            f"was *approved* by {query.from_user.full_name}."
+                            f"✅ {full_name}'s {action} for '{reason}' was *approved* by {query.from_user.full_name}."
                         ),
                         parse_mode="Markdown"
                     )
                 except Exception as e:
-                    print(f"❗Failed to update message for admin {record['admin_id']}: {e}")
-
+                    print(f"❗Failed to update admin message: {e}")
         context.bot_data["pending_requests"].pop(request_id, None)
 
     elif parts[0] == "deny":
         user_id, full_name, group_chat_id = parts[1:]
-        group_chat_id = int(group_chat_id)
+        try:
+            group_chat_id = int(group_chat_id)
+        except ValueError:
+            group_chat_id = int(os.getenv("GROUP_CHAT_ID"))
 
-        # Identify request
         request_id = None
         for key in context.bot_data.get("pending_requests", {}):
             if key.startswith(f"{user_id}|"):
                 request_id = key
                 break
 
-        await context.bot.send_message(
-            chat_id=group_chat_id,
-            text=f"❌ {full_name}'s request has been *denied* by {query.from_user.full_name}.",
-            parse_mode="Markdown"
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=f"❌ {full_name}'s request has been *denied* by {query.from_user.full_name}.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"[ERROR] Could not notify group on denial: {e}")
 
-        # Update all other admin messages
         if request_id:
             for record in context.bot_data["pending_requests"].get(request_id, []):
                 if record["admin_id"] != query.from_user.id:
@@ -192,14 +219,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.edit_message_text(
                             chat_id=record["admin_id"],
                             message_id=record["message_id"],
-                            text=(
-                                f"❌ {full_name}'s request was *denied* "
-                                f"by {query.from_user.full_name}."
-                            ),
+                            text=f"❌ {full_name}'s request was *denied* by {query.from_user.full_name}.",
                             parse_mode="Markdown"
                         )
                     except Exception as e:
-                        print(f"❗Failed to update message for admin {record['admin_id']}: {e}")
+                        print(f"❗Failed to update admin message: {e}")
             context.bot_data["pending_requests"].pop(request_id, None)
 
 # --- Webhook Receiver ---
@@ -213,15 +237,13 @@ def webhook():
     loop.run_until_complete(telegram_app.process_update(update))
     return "OK", 200
 
-# --- Run Bot ---
+# --- Entrypoint ---
 def run():
     global telegram_app
     setup_google_sheets()
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-    # Replace with your admin Telegram user IDs
-    telegram_app.bot_data["admins"] = [123456789, 987654321]
+    telegram_app.bot_data["admins"] = [123456789, 987654321]  # Replace with your admin Telegram user IDs
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_command))
