@@ -1,4 +1,3 @@
-# main.py
 import os
 import logging
 import asyncio
@@ -73,44 +72,6 @@ def _callback(fut):
         fut.result()
     except Exception:
         logger.exception("❌ Exception in handler")
-
-# --- Helper Text Builders ---
-def build_admin_pm_text(user_full_name, user_id, action, days, reason, current_off):
-    delta = float(days)
-    new_balance = current_off + delta if action == "clockoff" else current_off - delta
-    return (
-        f"🆕 *{action.title()} Request*\n\n"
-        f"👤 User: {user_full_name} ({user_id})\n"
-        f"📅 Days: {days}\n"
-        f"📝 Reason: {reason}\n\n"
-        f"📊 Current Off: {current_off:.1f} day(s)\n"
-        f"📈 New Balance: {new_balance:.1f} day(s)\n\n"
-        "✅ Approve or ❌ Deny?"
-    )
-
-def build_user_group_confirmation(action, days, reason):
-    action_text = "Clock Off" if action == "clockoff" else "Claim Off"
-    return (
-        f"📝 Your *{action_text}* request for {days} day(s) has been submitted.\n"
-        f"Reason: {reason}\n\n"
-        "⏳ Awaiting admin approval..."
-    )
-
-def build_user_final_response(action, days, reason, final_balance, approved=True):
-    action_text = "Clock Off" if action == "clockoff" else "Claim Off"
-    if approved:
-        return (
-            f"✅ Your *{action_text}* request has been approved!\n\n"
-            f"📅 Days: {days}\n"
-            f"📝 Reason: {reason}\n"
-            f"📊 New Balance: {final_balance:.1f} day(s)"
-        )
-    else:
-        return (
-            f"❌ Your *{action_text}* request was rejected.\n\n"
-            f"📅 Days: {days}\n"
-            f"📝 Reason: {reason}"
-        )
 
 # --- Commands ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -196,11 +157,13 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         all_data = worksheet.get_all_values()
         user_rows = [row for row in all_data if row[1] == str(user.id)]
         current_off = float(user_rows[-1][6]) if user_rows else 0.0
+        delta = float(state["days"])
+        new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
 
-        # Confirm submission in group
+        # Confirmation in group chat
         await context.bot.send_message(
             chat_id=group_id,
-            text=build_user_group_confirmation(state['action'], state['days'], state['reason']),
+            text=f"📨 {user.full_name} has submitted a request for *{state['action']}* of {delta} day(s). Awaiting approval.",
             parse_mode="Markdown"
         )
 
@@ -209,13 +172,22 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
             if admin.user.is_bot:
                 continue
             try:
+                callback_id = f"{user.id}_{admin.user.id}"
                 await context.bot.send_message(
                     chat_id=admin.user.id,
-                    text=build_admin_pm_text(user.full_name, user.id, state['action'], state['days'], state['reason'], current_off),
+                    text=(
+                        f"🆕 *{state['action'].title()} Request*\n\n"
+                        f"👤 User: {user.full_name} ({user.id})\n"
+                        f"📅 Days: {delta}\n"
+                        f"📝 Reason: {state['reason']}\n\n"
+                        f"📊 Current Off: {current_off:.1f} day(s)\n"
+                        f"📈 New Balance: {new_off:.1f} day(s)\n\n"
+                        "✅ Approve or ❌ Deny?"
+                    ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{user.full_name}|{state['action']}|{state['days']}|{state['reason']}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['action']}|{state['days']}|{state['reason']}")
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{callback_id}|{user.full_name}|{state['action']}|{delta}|{state['reason']}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{callback_id}|{user.id}")
                     ]])
                 )
             except Exception as e:
@@ -229,7 +201,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("approve|"):
-        _, user_id, full_name, action, days, reason = data.split("|")
+        _, _, user_id, full_name, action, days, reason = data.split("|", maxsplit=6)
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         date = now.strftime("%Y-%m-%d")
@@ -256,9 +228,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
             await query.edit_message_text("✅ Request approved and recorded.")
+
             await context.bot.send_message(
                 chat_id=int(user_id),
-                text=build_user_final_response(action, days, reason, final, approved=True),
+                text=(
+                    f"✅ Your *{action.replace('off', ' Off')}* request has been approved!\n\n"
+                    f"📅 Days: {days}\n"
+                    f"📝 Reason: {reason}\n"
+                    f"📊 New Balance: {final:.1f} day(s)"
+                ),
                 parse_mode="Markdown"
             )
         except Exception:
@@ -266,13 +244,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Failed to approve request.")
 
     elif data.startswith("deny|"):
-        _, user_id, action, days, reason = data.split("|")
+        _, _, user_id = data.split("|", maxsplit=2)
         await query.edit_message_text("❌ Request denied.")
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=build_user_final_response(action, days, reason, 0.0, approved=False),
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=int(user_id), text="❌ Your request was denied.")
 
 # --- Init ---
 async def init_app():
