@@ -31,6 +31,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "/etc/secrets/credentials.json")
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
 
 # --- Flask ---
 app = Flask(__name__)
@@ -178,8 +179,8 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}_{admin.user.id}|{user.full_name}|{state['action']}|{state['days']}|{state['reason']}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}_{admin.user.id}|{user.id}")
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{user.full_name}|{state['action']}|{state['days']}|{state['reason']}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{user.full_name}")
                     ]])
                 )
             except Exception as e:
@@ -193,13 +194,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("approve|"):
-        try:
-            _, callback_id, full_name, action, days, reason = data.split("|", maxsplit=5)
-            user_id = callback_id.split("_")[0]
-            now = datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            date = now.strftime("%Y-%m-%d")
+        _, user_id, full_name, action, days, reason = data.split("|", maxsplit=6)
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        date = now.strftime("%Y-%m-%d")
 
+        try:
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if row[1] == str(user_id)]
             current_off = float(rows[-1][6]) if rows else 0.0
@@ -221,10 +221,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
             await query.edit_message_text("✅ Request approved and recorded.")
+
             await context.bot.send_message(
-                chat_id=int(user_id),
+                chat_id=GROUP_CHAT_ID,
                 text=(
-                    f"✅ Your *{action.replace('off', ' Off')}* request has been approved!\n\n"
+                    f"✅ *{full_name}*'s *{action.replace('off', ' Off')}* request has been approved!\n\n"
                     f"📅 Days: {days}\n"
                     f"📝 Reason: {reason}\n"
                     f"📊 New Balance: {final:.1f} day(s)"
@@ -232,17 +233,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except Exception:
-            logger.exception("❌ Failed to process approval")
+            logger.exception("❌ Failed to write to sheet")
             await query.edit_message_text("❌ Failed to approve request.")
 
     elif data.startswith("deny|"):
-        try:
-            _, callback_id, user_id = data.split("|", maxsplit=2)
-            await query.edit_message_text("❌ Request denied.")
-            await context.bot.send_message(chat_id=int(user_id), text="❌ Your request was denied.")
-        except Exception:
-            logger.exception("❌ Failed to process denial")
-            await query.edit_message_text("❌ Failed to deny request.")
+        _, user_id, full_name = data.split("|", maxsplit=2)
+        await query.edit_message_text("❌ Request denied.")
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"❌ *{query.from_user.full_name}* has rejected *{full_name}*'s request.",
+            parse_mode="Markdown"
+        )
 
 # --- Init ---
 async def init_app():
