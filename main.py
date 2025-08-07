@@ -1,3 +1,4 @@
+# --- Imports ---
 import os
 import logging
 import asyncio
@@ -8,12 +9,8 @@ from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -108,7 +105,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_rows = [row for row in all_data if row[1] == str(user.id)]
         if user_rows:
             last_5 = user_rows[-5:]
-            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[8]}" for row in last_5])
+            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[9]}" for row in last_5])
             await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
         else:
             await update.message.reply_text("📜 No logs found.")
@@ -139,10 +136,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
                 raise ValueError()
             state["days"] = days
+            state["stage"] = "awaiting_application_date"
+            await update.message.reply_text("📅 What is the application date? (YYYY-MM-DD)")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
+
+    elif state["stage"] == "awaiting_application_date":
+        try:
+            datetime.strptime(message, "%Y-%m-%d")
+            state["application_date"] = message
             state["stage"] = "awaiting_reason"
             await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
         except ValueError:
-            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
+            await update.message.reply_text("❌ Invalid date. Use YYYY-MM-DD format.")
 
     elif state["stage"] == "awaiting_reason":
         reason = message[:20]
@@ -175,6 +181,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                         f"🆕 *{state['action'].title()} Request*\n\n"
                         f"👤 User: {user.full_name} ({user.id})\n"
                         f"📅 Days: {state['days']}\n"
+                        f"📅 Application Date: {state['application_date']}\n"
                         f"📝 Reason: {state['reason']}\n\n"
                         f"📊 Current Off: {current_off:.1f} day(s)\n"
                         f"📈 New Balance: {new_off:.1f} day(s)\n\n"
@@ -182,7 +189,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{group_id}"),
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{state['application_date']}|{group_id}"),
                         InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['reason']}|{group_id}")
                     ]])
                 )
@@ -199,10 +206,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if data.startswith("approve|"):
-            _, user_id, action, days, reason, group_id = data.split("|")
+            _, user_id, action, days, reason, application_date, group_id = data.split("|")
             now = datetime.now()
             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            date = now.strftime("%Y-%m-%d")
 
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if row[1] == str(user_id)]
@@ -211,16 +217,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final = current_off + delta if action == "clockoff" else current_off - delta
             add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
 
+            user_name = rows[-1][2] if rows and rows[-1][2] else "Unknown"
             worksheet.append_row([
-                date, str(user_id), "", action.title().replace("off", " Off"),
+                timestamp, str(user_id), user_name, action.title().replace("off", " Off"),
                 f"{current_off:.1f}", add_subtract, f"{final:.1f}",
-                query.from_user.full_name, reason, timestamp
+                query.from_user.full_name, application_date, reason
             ])
 
             await query.edit_message_text("✅ Request approved and recorded.")
             await context.bot.send_message(
                 chat_id=int(group_id),
-                text=f"✅ {user_id}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📊 Final: {final:.1f} day(s)"
+                text=f"✅ {user_name}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📊 Final: {final:.1f} day(s)"
             )
 
         elif data.startswith("deny|"):
@@ -228,10 +235,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Request denied.")
             await context.bot.send_message(
                 chat_id=int(group_id),
-                text=f"❌ {user_id}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
+                text=f"❌ Request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
             )
 
-        # Clean up all admin messages
         if user_id in admin_message_refs:
             for admin_id, msg_id in admin_message_refs[user_id]:
                 if admin_id != query.from_user.id:
