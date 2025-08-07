@@ -41,13 +41,12 @@ executor = ThreadPoolExecutor()
 user_state = {}
 
 # --- Load Environment Variables ---
-load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("SHEET_ID")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 # --- Google Sheets Setup ---
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/credentials.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
 worksheet = sheet.get_worksheet(0)
