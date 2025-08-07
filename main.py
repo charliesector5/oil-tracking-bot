@@ -1,28 +1,38 @@
 import os
 import logging
 import asyncio
-from datetime import datetime
+import nest_asyncio
+import gspread
+from flask import Flask, request
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 # --- Logging ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# --- Flask ---
-from flask import Flask, request
-from concurrent.futures import ThreadPoolExecutor
+# --- Env ---
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "/etc/secrets/credentials.json")
 
+# --- Flask ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -39,151 +49,109 @@ worksheet = None
 loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 user_state = {}
+admin_message_refs = {}
 
-# --- Load Environment Variables ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    global telegram_app
+    if telegram_app is None:
+        logger.warning("⚠️ Telegram app not yet initialized.")
+        return "Bot not ready", 503
 
-# --- Google Sheets Setup ---
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/credentials.json", scope)
-client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID)
-worksheet = sheet.get_worksheet(0)
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
+        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        future.add_done_callback(_callback)
+        return "OK"
+    except Exception:
+        logger.exception("❌ Error processing update")
+        return "Internal Server Error", 500
 
-# --- Telegram Helpers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hi! Use /clockoff or /claimoff to manage your OIL.")
+def _callback(fut):
+    try:
+        fut.result()
+    except Exception:
+        logger.exception("❌ Exception in handler")
+
+# --- Commands ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛠️ *Oil Tracking Bot Help*\n\n"
+        "/clockoff – Request to clock OIL\n"
+        "/claimoff – Request to claim OIL\n"
+        "/summary – See how much OIL you have left\n"
+        "/history – See your past 5 OIL logs\n"
+        "/help – Show this help message",
+        parse_mode="Markdown"
+    )
+
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        all_data = worksheet.get_all_values()
+        user_rows = [row for row in all_data if row[1] == str(user.id)]
+        if user_rows:
+            last_row = user_rows[-1]
+            balance = last_row[6]
+            await update.message.reply_text(f"📊 Your current off balance: {balance} day(s).")
+        else:
+            await update.message.reply_text("📊 No records found.")
+    except Exception:
+        logger.exception("❌ Failed to fetch summary")
+        await update.message.reply_text("❌ Could not retrieve your summary.")
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        all_data = worksheet.get_all_values()
+        user_rows = [row for row in all_data if row[1] == str(user.id)]
+        if user_rows:
+            last_5 = user_rows[-5:]
+            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[9]}" for row in last_5])
+            await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
+        else:
+            await update.message.reply_text("📜 No logs found.")
+    except Exception:
+        logger.exception("❌ Failed to fetch history")
+        await update.message.reply_text("❌ Could not retrieve your logs.")
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_oil_request(update, context, action="Clock Off")
+    user_state[update.effective_user.id] = {"action": "clockoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🕒 How many days do you want to clock off? (0.5 to 3, in 0.5 increments)")
 
 async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_oil_request(update, context, action="Claim Off")
-
-async def handle_oil_request(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
-    user = update.effective_user
-    chat = update.effective_chat
-    user_state[user.id] = {
-        "step": "days",
-        "action": action,
-        "name": user.full_name,
-        "telegram_id": user.id,
-        "chat_id": chat.id,
-    }
-    await context.bot.send_message(chat.id, f"📅 How many days do you want to {action.lower()}?")
+    user_state[update.effective_user.id] = {"action": "claimoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🧾 How many days do you want to claim off? (0.5 to 3, in 0.5 increments)")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in user_state:
+    user_id = update.effective_user.id
+    message = update.message.text.strip()
+
+    if user_id not in user_state:
         return
 
-    state = user_state[user.id]
-    text = update.message.text.strip()
+    state = user_state[user_id]
 
-    if state["step"] == "days":
+    if state["stage"] == "awaiting_days":
         try:
-            state["days"] = float(text)
-            state["step"] = "date"
-            await update.message.reply_text("📆 Enter the application date in YYYY-MM-DD format:")
+            days = float(message)
+            if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
+                raise ValueError()
+            state["days"] = days
+            state["stage"] = "awaiting_application_date"
+            await update.message.reply_text("📅 What's the application date? (Format: YYYY-MM-DD)")
         except ValueError:
-            await update.message.reply_text("⚠️ Please enter a valid number (e.g., 0.5, 1, 2.5).")
-    elif state["step"] == "date":
+            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
+
+    elif state["stage"] == "awaiting_application_date":
         try:
-            datetime.strptime(text, "%Y-%m-%d")
-            state["application_date"] = text
-            state["step"] = "reason"
-            await update.message.reply_text("📝 Any remarks? (Type 'nil' if none)")
+            datetime.strptime(message, "%Y-%m-%d")
+            state["application_date"] = message
+            state["stage"] = "awaiting_reason"
+            await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
         except ValueError:
-            await update.message.reply_text("⚠️ Invalid date format. Please use YYYY-MM-DD.")
-    elif state["step"] == "reason":
-        state["remarks"] = text
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data="approve"),
-                InlineKeyboardButton("❌ Deny", callback_data="deny"),
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        msg = await context.bot.send_message(
-            chat_id=state["chat_id"],
-            text=f"🔔 {state['name']} requested to *{state['action']}*.\n📅 Days: {state['days']}\n📝 Reason: {state['remarks']}\n📆 Application Date: {state['application_date']}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-        state["msg_id"] = msg.message_id
-        user_state[user.id] = state
+            await update.message.reply_text("❌ Invalid date. Use format YYYY-MM-DD.")
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    admin_user = update.effective_user.full_name
-
-    for user_id, state in user_state.items():
-        if "msg_id" in state and state["msg_id"] == query.message.message_id:
-            change = +state["days"] if state["action"] == "Clock Off" else -state["days"]
-            current = get_latest_off(user_id)
-            final = current + change
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            worksheet.append_row([
-                timestamp,
-                state["telegram_id"],
-                state["name"],
-                state["action"],
-                current,
-                f"{'+' if change > 0 else ''}{change}",
-                final,
-                admin_user if query.data == "approve" else "Rejected",
-                state["application_date"],
-                state["remarks"]
-            ])
-
-            status = "approved" if query.data == "approve" else "denied"
-            reply = (
-                f"✅ {state['name']}'s {state['action']} approved by {admin_user}.\n"
-                f"📅 Days: {state['days']}\n"
-                f"📝 Reason: {state['remarks']}\n"
-                f"📊 Final: {final} day(s)"
-                if query.data == "approve"
-                else f"❌ {state['name']}'s {state['action']} was denied by {admin_user}.\n📝 Reason: {state['remarks']}"
-            )
-
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text=reply
-            )
-
-            await context.bot.send_message(chat_id=state["chat_id"], text=reply)
-            del user_state[user_id]
-            break
-
-def get_latest_off(user_id):
-    records = worksheet.get_all_values()
-    filtered = [r for r in records if r[1] == str(user_id) and r[6]]
-    if filtered:
-        try:
-            return float(filtered[-1][6])
-        except ValueError:
-            return 0.0
-    return 0.0
-
-# --- Main Bot Entry ---
-def main():
-    global telegram_app
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
-    telegram_app.add_handler(CommandHandler("claimoff", claimoff))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    telegram_app.add_handler(CallbackQueryHandler(button))
-
-    loop.create_task(telegram_app.run_polling())
-
-# --- Run Flask App ---
-if __name__ == '__main__':
-    with loop:
-        loop.run_in_executor(executor, main)
-        app.run(host='0.0.0.0', port=10000)
+    elif state["stage"] == "awaiting_reason":
+        reas
