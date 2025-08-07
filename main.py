@@ -1,3 +1,4 @@
+# main.py
 import os
 import logging
 import asyncio
@@ -182,7 +183,6 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("❌ Failed to fetch or notify admins")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global worksheet  # ✅ FIXED: Ensure worksheet is accessible
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -194,6 +194,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = now.strftime("%Y-%m-%d")
 
         try:
+            requester_chat = await context.bot.get_chat(int(user_id))
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if row[1] == str(user_id)]
             current_off = float(rows[-1][6]) if rows else 0.0
@@ -204,12 +205,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             worksheet.append_row([
                 date,
                 str(user_id),
-                "",  # Name left blank
+                requester_chat.full_name,  # ✅ Log requester name here
                 "Clock Off" if action == "clockoff" else "Claim Off",
                 f"{current_off:.1f}",
                 add_subtract,
                 f"{final:.1f}",
-                query.from_user.full_name,
+                query.from_user.full_name,  # ✅ Approver name
                 reason,
                 timestamp
             ])
