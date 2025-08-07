@@ -73,8 +73,17 @@ def _callback(fut):
         logger.exception("❌ Exception in Telegram handler task")
 
 # --- Telegram Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome to the Oil Tracking Bot!")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛠️ *Oil Tracking Bot Help*\n"
+        "\n"
+        "/clockoff – Request to clock OIL\n"
+        "/claimoff – Request to claim OIL\n"
+        "/summary – See how much OIL you have left\n"
+        "/history – See your past 5 OIL logs\n"
+        "/help – Show this help message\n",
+        parse_mode="Markdown"
+    )
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -114,7 +123,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         user = update.effective_user
 
-        # Get current off balance
         try:
             current_data = worksheet.get_all_values()
             user_rows = [row for row in current_data if row[1] == str(user.id)]
@@ -154,45 +162,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_state.pop(user_id)
 
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"📩 /summary received from {user.id} ({user.full_name})")
-
-    try:
-        current_data = worksheet.get_all_values()
-        user_rows = [row for row in current_data if row[1] == str(user.id)]
-
-        if user_rows:
-            last_row = user_rows[-1]
-            final_off = float(last_row[6])
-            await update.message.reply_text(f"📊 You currently have {final_off:.1f} off(s).")
-        else:
-            await update.message.reply_text("📊 No records found for you.")
-    except Exception:
-        logger.exception("❌ Failed to fetch summary")
-        await update.message.reply_text("❌ Failed to fetch summary. Please try again later.")
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"📩 /history received from {user.id} ({user.full_name})")
-
-    try:
-        current_data = worksheet.get_all_values()
-        user_rows = [row for row in current_data if row[1] == str(user.id)]
-
-        if user_rows:
-            recent = user_rows[-5:]  # Last 5 records
-            msg_lines = ["🕓 Your recent OIL records:"]
-            for row in recent:
-                date, _, _, action, _, change, final, _, reason, _ = row
-                msg_lines.append(f"{date}: {action} {change} → {final} ({reason})")
-            await update.message.reply_text("\n".join(msg_lines))
-        else:
-            await update.message.reply_text("📄 No history found for you.")
-    except Exception:
-        logger.exception("❌ Failed to fetch history")
-        await update.message.reply_text("❌ Failed to fetch history. Please try again later.")
-
 # --- Initialization ---
 async def init_app():
     global telegram_app, worksheet
@@ -211,11 +180,9 @@ async def init_app():
 
     logger.info("⚙️ Initializing Telegram Application...")
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
-    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
     telegram_app.add_handler(CommandHandler("claimoff", claimoff))
-    telegram_app.add_handler(CommandHandler("summary", summary))
-    telegram_app.add_handler(CommandHandler("history", history))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await telegram_app.initialize()
