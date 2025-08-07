@@ -1,4 +1,3 @@
-# --- Imports ---
 import os
 import logging
 import asyncio
@@ -9,17 +8,18 @@ from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # --- Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- Env ---
@@ -105,7 +105,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_rows = [row for row in all_data if row[1] == str(user.id)]
         if user_rows:
             last_5 = user_rows[-5:]
-            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[9]}" for row in last_5])
+            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[8]}" for row in last_5])
             await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
         else:
             await update.message.reply_text("📜 No logs found.")
@@ -136,19 +136,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
                 raise ValueError()
             state["days"] = days
-            state["stage"] = "awaiting_application_date"
-            await update.message.reply_text("📅 What is the application date? (YYYY-MM-DD)")
+            state["stage"] = "awaiting_date"
+            await update.message.reply_text("📅 When is the application date? (YYYY-MM-DD)")
         except ValueError:
             await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
 
-    elif state["stage"] == "awaiting_application_date":
+    elif state["stage"] == "awaiting_date":
         try:
             datetime.strptime(message, "%Y-%m-%d")
-            state["application_date"] = message
+            state["app_date"] = message
             state["stage"] = "awaiting_reason"
             await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
         except ValueError:
-            await update.message.reply_text("❌ Invalid date. Use YYYY-MM-DD format.")
+            await update.message.reply_text("❌ Invalid date. Please use YYYY-MM-DD format.")
 
     elif state["stage"] == "awaiting_reason":
         reason = message[:20]
@@ -157,116 +157,88 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📩 Your request has been submitted for approval.")
         await send_approval_request(update, context, state)
         user_state.pop(user_id)
-
 async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
     user = update.effective_user
-    group_id = state["group_id"]
+    admins = await context.bot.get_chat_administrators(state["group_id"])
+    user_balance = get_current_balance(user.id)
+
+    action = "Clock Off" if state["action"] == "clockoff" else "Claim Off"
+    delta = f"+{state['days']}" if state["action"] == "clockoff" else f"-{state['days']}"
+    new_balance = float(user_balance) + float(state["days"]) if state["action"] == "clockoff" else float(user_balance) - float(state["days"])
+
+    text = (
+        f"📝 *{action} Request*\n"
+        f"👤 {user.full_name}\n"
+        f"📅 Days: {state['days']}\n"
+        f"📆 Application Date: {state['app_date']}\n"
+        f"📝 Reason: {state['reason']}\n"
+        f"📊 Final: {new_balance:.1f} day(s)"
+    )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['days']}|{state['reason']}|{state['action']}|{state['app_date']}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject|{user.id}")
+    ]])
+
+    for admin in admins:
+        try:
+            msg = await context.bot.send_message(chat_id=admin.user.id, text=text, parse_mode="Markdown", reply_markup=keyboard)
+            admin_message_refs[msg.message_id] = user.id
+        except Exception as e:
+            logger.warning(f"⚠️ Cannot PM admin {admin.user.id}: {e}")
+
+def get_current_balance(user_id):
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if row[1] == str(user.id)]
-        current_off = float(user_rows[-1][6]) if user_rows else 0.0
-        delta = float(state["days"])
-        new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
-
-        admins = await context.bot.get_chat_administrators(group_id)
-        admin_message_refs[user.id] = []
-
-        for admin in admins:
-            if admin.user.is_bot:
-                continue
-            try:
-                msg = await context.bot.send_message(
-                    chat_id=admin.user.id,
-                    text=(
-                        f"🆕 *{state['action'].title()} Request*\n\n"
-                        f"👤 User: {user.full_name} ({user.id})\n"
-                        f"📅 Days: {state['days']}\n"
-                        f"📅 Application Date: {state['application_date']}\n"
-                        f"📝 Reason: {state['reason']}\n\n"
-                        f"📊 Current Off: {current_off:.1f} day(s)\n"
-                        f"📈 New Balance: {new_off:.1f} day(s)\n\n"
-                        "✅ Approve or ❌ Deny?"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{state['application_date']}|{group_id}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['reason']}|{group_id}")
-                    ]])
-                )
-                admin_message_refs[user.id].append((admin.user.id, msg.message_id))
-            except Exception as e:
-                logger.warning(f"⚠️ Cannot PM admin {admin.user.id}: {e}")
-    except Exception:
-        logger.exception("❌ Failed to fetch or notify admins")
+        user_rows = [row for row in all_data if row[1] == str(user_id)]
+        return float(user_rows[-1][6]) if user_rows else 0.0
+    except:
+        return 0.0
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data = query.data.split('|')
 
-    try:
-        if data.startswith("approve|"):
-            _, user_id, action, days, reason, application_date, group_id = data.split("|")
-            now = datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    if data[0] == "reject":
+        await query.edit_message_text("❌ Request rejected.")
+        return
 
-            all_data = worksheet.get_all_values()
-            rows = [row for row in all_data if row[1] == str(user_id)]
-            current_off = float(rows[-1][6]) if rows else 0.0
-            delta = float(days)
-            final = current_off + delta if action == "clockoff" else current_off - delta
-            add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
+    user_id, days, reason, action, app_date = data[1], float(data[2]), data[3], data[4], data[5]
+    approver = query.from_user.full_name
 
-            user_name = rows[-1][2] if rows and rows[-1][2] else "Unknown"
-            worksheet.append_row([
-                timestamp, str(user_id), user_name, action.title().replace("off", " Off"),
-                f"{current_off:.1f}", add_subtract, f"{final:.1f}",
-                query.from_user.full_name, application_date, reason
-            ])
+    current = get_current_balance(user_id)
+    new_balance = current + days if action == "clockoff" else current - days
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            await query.edit_message_text("✅ Request approved and recorded.")
-            await context.bot.send_message(
-                chat_id=int(group_id),
-                text=f"✅ {user_name}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📊 Final: {final:.1f} day(s)"
-            )
+    # Log to Google Sheet
+    worksheet.append_row([
+        timestamp,
+        str(user_id),
+        context.bot.get_chat_member(update.effective_chat.id, int(user_id)).user.full_name,
+        action,
+        f"{current:.1f}",
+        f"{'+' if action == 'clockoff' else '-'}{days}",
+        f"{new_balance:.1f}",
+        approver,
+        app_date,
+        reason
+    ])
 
-        elif data.startswith("deny|"):
-            _, user_id, reason, group_id = data.split("|")
-            await query.edit_message_text("❌ Request denied.")
-            await context.bot.send_message(
-                chat_id=int(group_id),
-                text=f"❌ Request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
-            )
+    # Confirmation Message
+    await query.edit_message_text(
+        f"✅ {context.bot.get_chat_member(update.effective_chat.id, int(user_id)).user.full_name}'s {action} approved by {approver}.\n"
+        f"📅 Days: {days}\n"
+        f"📝 Reason: {reason}\n"
+        f"📊 Final: {new_balance:.1f} day(s)"
+    )
 
-        if user_id in admin_message_refs:
-            for admin_id, msg_id in admin_message_refs[user_id]:
-                if admin_id != query.from_user.id:
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=admin_id,
-                            message_id=msg_id,
-                            text=f"⚠️ Request already handled by {query.from_user.full_name}.",
-                        )
-                    except Exception:
-                        pass
-            del admin_message_refs[user_id]
-
-    except Exception:
-        logger.exception("❌ Failed to process callback")
-        await query.edit_message_text("❌ Something went wrong.")
-
-# --- Init ---
-async def init_app():
+def init_app():
     global telegram_app, worksheet
+    nest_asyncio.apply()
 
-    logger.info("🔐 Connecting to Google Sheets...")
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
-    client = gspread.authorize(creds)
-    worksheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-    logger.info("✅ Google Sheets ready.")
-
-    telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
+    # Telegram Bot
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("summary", summary))
     telegram_app.add_handler(CommandHandler("history", history))
@@ -275,15 +247,19 @@ async def init_app():
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info("🚀 Webhook set.")
+    # Google Sheets
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
+    gc = gspread.authorize(creds)
+    worksheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+    # Webhook
+    telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    logger.info("🚀 Bot is running and webhook is set.")
 
 # --- Run ---
-if __name__ == "__main__":
-    nest_asyncio.apply()
-    import threading
-    threading.Thread(target=loop.run_forever, daemon=True).start()
-    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
-    logger.info("🟢 Starting Flask...")
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    init_app()
+    from threading import Thread
+    Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 10000}).start()
+    loop.run_forever()
