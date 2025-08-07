@@ -41,11 +41,18 @@ def webhook():
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
         logger.info(f"📨 Incoming update: {update}")
-        future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app._running_loop)
+        fut = loop.run_in_executor(executor, telegram_app.process_update, update)
+        fut.add_done_callback(_callback)
         return "OK", 200
     except Exception as e:
         logger.exception("❌ Error processing update")
         return "Error", 500
+
+def _callback(fut):
+    try:
+        fut.result()
+    except Exception as e:
+        logger.exception("❌ Exception in handler")
 
 # --- Sheet Functions ---
 def init_sheet():
@@ -165,7 +172,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     final_off = round(current_off + delta, 2)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Append to Sheet
     log_to_sheet(
         timestamp=timestamp,
         telegram_id=user_id,
