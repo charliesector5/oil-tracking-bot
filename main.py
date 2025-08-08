@@ -79,7 +79,7 @@ pending_requests = {}
 admin_message_refs = {}
 
 # Calendar sessions (for date picking)
-# token -> {user_id, year, month, purpose, action, days, reason, group_id}
+# token -> {user_id, year, month}
 calendar_sessions = {}
 
 # Mass actions: preview & confirm
@@ -96,10 +96,6 @@ MAX_DAYS = 3.0
 # =========================
 # Helpers
 # =========================
-
-def is_admin(ctx: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int) -> bool:
-    # NOTE: We'll check at runtime in handlers, but this helper is here if needed
-    return True  # We still verify in the async path; this is a placeholder signature.
 
 def valid_days_str(s: str) -> bool:
     try:
@@ -143,7 +139,6 @@ def month_calendar_kb(cal_token: str, year: int, month: int, include_manual=True
         for d in week:
             label = str(d.day)
             if d.month != month:
-                # dim other-month days: still clickable but with parentheses
                 label = f"({d.day})"
             btns.append(InlineKeyboardButton(label, callback_data=f"cal|{cal_token}|SEL|{d.isoformat()}"))
         rows.append(btns)
@@ -302,7 +297,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# -------- summary/history (same behavior as your working copy) --------
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
@@ -311,7 +305,6 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_rows:
             last_row = user_rows[-1]
             balance = last_row[6]
-            # PH Off Total not maintained in this script (calculated elsewhere)
             await update.message.reply_text(f"📊 Current Off Balance: {balance} day(s).")
         else:
             await update.message.reply_text("📊 No records found.")
@@ -362,7 +355,6 @@ async def claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- Mass flows (admin only) --------
 async def massclock_prepare(update: Update, context: ContextTypes.DEFAULT_TYPE, *, is_ph: bool):
-    # Check admin
     group_id = update.message.chat_id
     admin_ids = await get_group_admin_ids(context.bot, group_id)
     if update.effective_user.id not in admin_ids:
@@ -388,12 +380,10 @@ async def massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- Inline calendar launching --------
 async def ask_for_application_date(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, purpose_note: str):
-    # purpose_note helps wording for claim vs clock
     today = date_cls.today()
     cal_token = uuid.uuid4().hex[:10]
     user_state[uid]["stage"] = "awaiting_date"
     user_state[uid]["cal_token"] = cal_token
-    # store current year/month, other context in calendar_sessions
     calendar_sessions[cal_token] = {
         "user_id": uid,
         "year": today.year,
@@ -405,7 +395,7 @@ async def ask_for_application_date(update: Update, context: ContextTypes.DEFAULT
     )
 
 # =========================
-# Message handler (conversation state)
+# Message handler
 # =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -426,7 +416,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_state[uid]
     stage = state.get("stage")
 
-    # === normal/mass stages ===
     if stage in ("awaiting_days", "mass_awaiting_days"):
         if not valid_days_str(text):
             await update.message.reply_text(
@@ -435,7 +424,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         state["days"] = float(text)
-        # 2) Application date: different wording for claim/clock
         if stage == "awaiting_days":
             if state["action"] == "claimoff":
                 note = "For claim off: date you want to *use* the off."
@@ -443,7 +431,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 note = "For clock off: date you *earned* or are earning the off."
             await ask_for_application_date(update, context, uid, note)
         else:
-            # mass path
             state["stage"] = "mass_awaiting_date"
             today = date_cls.today()
             cal_token = uuid.uuid4().hex[:10]
@@ -464,11 +451,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         state["app_date"] = dt
-        # move to reason
         state["stage"] = "awaiting_reason" if stage == "awaiting_manual_date" else "mass_awaiting_reason"
-        prompt = "📝 Remarks (max 80 chars)."
         await update.message.reply_text(
-            prompt,
+            "📝 Remarks (max 80 chars).",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|usr|{uid}")]])
         )
         return
@@ -481,12 +466,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["reason"] = reason
 
         if stage == "awaiting_reason":
-            # Send approval requests to admins
             await update.message.reply_text("📩 Your request has been submitted for approval.")
             await send_approval_request(update, context, state)
             user_state.pop(uid, None)
         else:
-            # mass preview
             members = unique_members_from_sheet()
             if not members:
                 await update.message.reply_text("⚠️ No members found to mass clock.")
@@ -529,7 +512,6 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         delta = float(state["days"])
         new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
 
-        # create a short token to keep callback_data <= 64 bytes
         token = uuid.uuid4().hex[:10]
         pending_requests[token] = {
             "user_id": user.id,
@@ -581,15 +563,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     try:
-        # --- Cancel buttons from prompts ---
+        # --- user cancel buttons ---
         if data.startswith("cancel|usr|"):
-            # user-level cancel
             _, _, uid_str = data.split("|")
             try:
                 uid = int(uid_str)
                 user_state.pop(uid, None)
             except Exception:
                 pass
+            await query.edit_message_text("🚪 Cancelled.")
+            return
+
+        # --- calendar cancel ---
+        if data.startswith("cancel|"):
+            _, cal_token = data.split("|", maxsplit=1)
+            calendar_sessions.pop(cal_token, None)
             await query.edit_message_text("🚪 Cancelled.")
             return
 
@@ -625,7 +613,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if kind == "MAN":
-                # switch to manual entry stage
                 if st.get("stage") == "awaiting_date":
                     st["stage"] = "awaiting_manual_date"
                 elif st.get("stage") == "mass_awaiting_date":
@@ -680,7 +667,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_off = get_user_current_off(user_id)
 
             if action_type == "approve":
-                # delta sign: positive for clock, negative for claim
                 delta = days if action == "clockoff" else -days
                 holiday_off = "Yes" if is_ph else "No"
                 expiry = "N/A"
@@ -707,7 +693,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     member = None
                 display_name = format_display_name(member, user_full_name, str(user_id))
 
-                await query.edit_message_text("✅ Request approved and recorded.")
+                # --- KEEP INFO in admin PM after approval ---
+                admin_summary = (
+                    f"✅ You approved this request.\n\n"
+                    f"👤 User: {display_name} ({user_id})\n"
+                    f"🔧 Action: {('PH ' if is_ph else '')}{action.replace('off',' Off')}\n"
+                    f"📅 Days: {days}\n"
+                    f"📆 Application Date: {app_date}\n"
+                    f"📝 Reason: {reason}\n"
+                    f"📊 Current → Final: {current_off:.1f} → {final:.1f}\n"
+                    f"🏷 Holiday Off: {holiday_off}\n"
+                    f"⏳ Expiry: {expiry}"
+                )
+                await query.edit_message_text(admin_summary)
+
                 await context.bot.send_message(
                     chat_id=group_id,
                     text=(
@@ -719,19 +718,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 )
             else:
-                # deny
                 try:
                     member = await context.bot.get_chat_member(group_id, user_id)
                 except Exception:
                     member = None
                 display_name = format_display_name(member, user_full_name, str(user_id))
-                await query.edit_message_text("❌ Request denied.")
+
+                # --- KEEP INFO in admin PM after rejection ---
+                admin_summary = (
+                    f"❌ You rejected this request.\n\n"
+                    f"👤 User: {display_name} ({user_id})\n"
+                    f"🔧 Action: {('PH ' if is_ph else '')}{action.replace('off',' Off')}\n"
+                    f"📅 Days: {days}\n"
+                    f"📆 Application Date: {app_date}\n"
+                    f"📝 Reason: {reason}"
+                )
+                await query.edit_message_text(admin_summary)
+
                 await context.bot.send_message(
                     chat_id=group_id,
                     text=f"❌ {display_name}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
                 )
 
-            # fan-out cleanup
+            # fan-out cleanup for other admins (include brief details)
+            handled_note = (
+                f"⚠️ Request handled by {query.from_user.full_name}.\n"
+                f"👤 {user_full_name} ({user_id}) | {('PH ' if is_ph else '')}{action.replace('off',' Off')} | {days} day(s)\n"
+                f"📆 {app_date} | 📝 {reason}"
+            )
             if token in admin_message_refs:
                 for admin_id, msg_id in admin_message_refs[token]:
                     if admin_id != query.from_user.id:
@@ -739,7 +753,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await context.bot.edit_message_text(
                                 chat_id=admin_id,
                                 message_id=msg_id,
-                                text=f"⚠️ Request already handled by {query.from_user.full_name}.",
+                                text=handled_note,
                             )
                         except Exception:
                             pass
@@ -761,7 +775,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if kind == "CONFIRM":
-                # Execute mass clock
                 is_ph = mreq["is_ph"]
                 days = float(mreq["days"])
                 app_date = mreq["app_date"]
@@ -769,19 +782,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 group_id = mreq["group_id"]
                 admin_name = query.from_user.full_name
 
-                # Validate days still positive and valid
                 if days <= 0 or days < MIN_DAYS or days > MAX_DAYS or (days * 10) % 5 != 0:
                     await query.edit_message_text("❌ Invalid days for mass clock.")
                     mass_requests.pop(token, None)
                     return
 
-                # Mass clock is "Clock Off" only (as per design)
                 success = 0
                 for m in mreq["members"]:
                     uid = m["id"]
                     uname = m["name"]
                     curr = get_user_current_off(uid)
-                    delta = days  # mass clock is always adding
+                    delta = days
                     holiday_off = "Yes" if is_ph else "No"
                     expiry = compute_expiry_if_ph(app_date) if is_ph else "N/A"
                     try:
@@ -809,7 +820,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mass_requests.pop(token, None)
                 return
 
-        # NOOP safe handler (header buttons)
         if data.startswith("noop|"):
             return
 
