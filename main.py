@@ -65,6 +65,21 @@ pending_requests = {}
 # token -> [(admin_id, message_id), ...]
 admin_message_refs = {}
 
+# Sheet column indices (after append)
+COL_TIMESTAMP = 0
+COL_TELEGRAM_ID = 1
+COL_NAME = 2
+COL_ACTION = 3
+COL_CURRENT_OFF = 4
+COL_ADD_SUB = 5
+COL_FINAL_OFF = 6
+COL_APPROVED_BY = 7
+COL_APP_DATE = 8
+COL_REMARKS = 9
+COL_HOLIDAY_OFF = 10
+COL_EXPIRY = 11
+COL_PH_OFF_TOTAL = 12
+
 # --- Helpers: Calendar UI ---
 def _build_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     cal = calendar.Calendar(firstweekday=0)  # Monday
@@ -139,9 +154,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠️ *Oil Tracking Bot Help*\n\n"
         "/clockoff – Request to clock OIL\n"
         "/claimoff – Request to claim OIL\n"
-        "/clockPHOil – Clock Public Holiday OIL (PH Off)\n"
-        "/claimPHOil – Claim Public Holiday OIL (PH Off)\n"
-        "/summary – See how much OIL & PH OIL you have left\n"
+        "/clockphoff – Clock *Public Holiday* OIL (PH Off)\n"
+        "/claimphoff – Claim *Public Holiday* OIL (PH Off)\n"
+        "/summary – See OIL & PH OIL balances and your PH entries\n"
         "/history – See your past 5 OIL logs\n"
         "/help – Show this help message",
         parse_mode="Markdown"
@@ -151,18 +166,46 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if len(row) >= 13 and row[1] == str(user.id)]
-        if user_rows:
-            last_row = user_rows[-1]
-            balance = last_row[6]  # Final Off
-            ph_total = last_row[11] if len(last_row) >= 12 else "0"  # old order fallback
-            if len(last_row) >= 13:
-                ph_total = last_row[12]  # PH Off Total (new index)
-            await update.message.reply_text(
-                f"📊 Your balances:\n• Normal Off: {balance} day(s)\n• PH Off: {ph_total} day(s)."
-            )
-        else:
+        user_rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == str(user.id)]
+        if not user_rows:
             await update.message.reply_text("📊 No records found.")
+            return
+
+        last_row = user_rows[-1]
+        normal_balance = last_row[COL_FINAL_OFF]
+        ph_total = last_row[COL_PH_OFF_TOTAL] if len(last_row) > COL_PH_OFF_TOTAL else "0"
+
+        # Active PH entries: Holiday Off == "Yes" and Action == "Clock Off (PH)" and Expiry >= today
+        today = dt_date.today()
+        active_entries = []
+        for r in user_rows:
+            try:
+                is_ph_row = (len(r) > COL_HOLIDAY_OFF and r[COL_HOLIDAY_OFF].strip().lower() == "yes")
+                is_ph_clock = (len(r) > COL_ACTION and r[COL_ACTION].startswith("Clock Off (PH)"))
+                expiry_str = r[COL_EXPIRY] if len(r) > COL_EXPIRY else "N/A"
+                if is_ph_row and is_ph_clock and expiry_str and expiry_str != "N/A":
+                    exp_dt = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                    if exp_dt >= today:
+                        app_date = r[COL_APP_DATE] if len(r) > COL_APP_DATE else "-"
+                        remark = r[COL_REMARKS] if len(r) > COL_REMARKS else ""
+                        active_entries.append((app_date, expiry_str, remark))
+            except Exception:
+                continue
+
+        lines = [
+            f"📊 Balances:",
+            f"• Normal Off: {normal_balance} day(s)",
+            f"• PH Off: {ph_total} day(s)"
+        ]
+        if active_entries:
+            lines.append("\n🏝️ Your active PH entries:")
+            for app, exp, rem in active_entries:
+                rem_part = f" — {rem}" if rem else ""
+                lines.append(f"• {app} → expires {exp}{rem_part}")
+        else:
+            lines.append("\n🏝️ No active PH entries.")
+
+        await update.message.reply_text("\n".join(lines))
     except Exception:
         logger.exception("❌ Failed to fetch summary")
         await update.message.reply_text("❌ Could not retrieve your summary.")
@@ -171,12 +214,11 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if row[1] == str(user.id)]
+        user_rows = [row for row in all_data if row[COL_TELEGRAM_ID] == str(user.id)]
         if user_rows:
             last_5 = user_rows[-5:]
-            # Show Application Date & Remarks as part of the history line
             response = "\n".join([
-                f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | App: {row[8]} | {row[9]}"
+                f"{row[COL_TIMESTAMP]} | {row[COL_ACTION]} | {row[COL_ADD_SUB]} → {row[COL_FINAL_OFF]} | App: {row[COL_APP_DATE]} | {row[COL_REMARKS]}"
                 for row in last_5
             ])
             await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
@@ -194,11 +236,11 @@ async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimoff", "stage": "awaiting_days"}
     await update.message.reply_text("🧾 How many days do you want to *claim off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
-async def clockPHOil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "clockph", "stage": "awaiting_days"}
     await update.message.reply_text("🏝️ How many *PH Off* days to *clock*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
-async def claimPHOil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimph", "stage": "awaiting_days"}
     await update.message.reply_text("🏝️ How many *PH Off* days to *claim*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
@@ -213,7 +255,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state = user_state[user_id]
-    action = state["action"]
 
     if state["stage"] == "awaiting_days":
         try:
@@ -259,21 +300,15 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
     group_id = state["group_id"]
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if len(row) >= 7 and row[1] == str(user.id)]
-        # Current normal off balance from Final Off column (index 6)
-        current_off = _safe_float(user_rows[-1][6]) if user_rows else 0.0
+        user_rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == str(user.id)]
+        current_off = _safe_float(user_rows[-1][COL_FINAL_OFF]) if user_rows else 0.0
 
         delta = float(state["days"])
         is_ph = state["action"] in ("clockph", "claimph")
 
-        # For preview, calculate what Final Off and PH Off Total *would* be
         if is_ph:
-            # PH actions do not change normal Final Off
-            new_off = current_off
-            # Determine last PH total (index 12 if present)
-            last_ph = 0.0
-            if user_rows and len(user_rows[-1]) >= 13:
-                last_ph = _safe_float(user_rows[-1][12], 0.0)
+            new_off = current_off  # PH doesn't change normal off balance
+            last_ph = _safe_float(user_rows[-1][COL_PH_OFF_TOTAL], 0.0) if (user_rows and len(user_rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
             new_ph = last_ph + delta if state["action"] == "clockph" else last_ph - delta
             ph_note = f"\n🏝️ PH Off Total → {last_ph:.1f} ➜ {new_ph:.1f}"
         else:
@@ -386,11 +421,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Fetch last balances
             all_data = worksheet.get_all_values()
-            rows = [row for row in all_data if len(row) >= 7 and row[1] == req_user_id]
-            current_off = _safe_float(rows[-1][6]) if rows else 0.0
-            last_ph_total = 0.0
-            if rows and len(rows[-1]) >= 13:
-                last_ph_total = _safe_float(rows[-1][12], 0.0)
+            rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == req_user_id]
+            current_off = _safe_float(rows[-1][COL_FINAL_OFF]) if rows else 0.0
+            last_ph_total = _safe_float(rows[-1][COL_PH_OFF_TOTAL], 0.0) if (rows and len(rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
 
             # Compute results depending on action
             is_ph = action in ("clockph", "claimph")
@@ -526,8 +559,8 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("history", history))
     telegram_app.add_handler(CommandHandler("clockoff", clockoff))
     telegram_app.add_handler(CommandHandler("claimoff", claimoff))
-    telegram_app.add_handler(CommandHandler("clockPHOil", clockPHOil))
-    telegram_app.add_handler(CommandHandler("claimPHOil", claimPHOil))
+    telegram_app.add_handler(CommandHandler("clockphoff", clockphoff))
+    telegram_app.add_handler(CommandHandler("claimphoff", claimphoff))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
