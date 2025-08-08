@@ -3,6 +3,7 @@ import logging
 import asyncio
 import nest_asyncio
 import gspread
+import uuid
 from flask import Flask, request
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
@@ -48,9 +49,19 @@ telegram_app = None
 worksheet = None
 loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
+
+# conversational state per user while filling the form
 user_state = {}
+
+# pending approval requests stored server-side to keep callback_data short
+# token -> {user_id, user_full_name, action, days, reason, group_id}
+pending_requests = {}
+
+# track admin PMs per token to clean up when one admin handles it
+# token -> [(admin_id, message_id), ...]
 admin_message_refs = {}
 
+# --- Webhook ---
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     global telegram_app
@@ -124,6 +135,9 @@ async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimoff", "stage": "awaiting_days"}
     await update.message.reply_text("🧾 How many days do you want to claim off? (0.5 to 3, in 0.5 increments)")
 
+# --- Conversation state machine ---
+MAX_REMARKS_LEN = 80  # enforce a sane cap regardless of callback_data now being short
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message.text.strip()
@@ -140,18 +154,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError()
             state["days"] = days
             state["stage"] = "awaiting_reason"
-            await update.message.reply_text("📝 What's the reason? (Max 20 characters)")
+            await update.message.reply_text(f"📝 What's the reason? (Max {MAX_REMARKS_LEN} characters)")
         except ValueError:
             await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
 
     elif state["stage"] == "awaiting_reason":
-        reason = message[:20]
+        reason = message
+        if len(reason) > MAX_REMARKS_LEN:
+            reason = reason[:MAX_REMARKS_LEN]
+            await update.message.reply_text(f"✂️ Remarks trimmed to {MAX_REMARKS_LEN} characters.")
         state["reason"] = reason
         state["group_id"] = update.message.chat_id
         await update.message.reply_text("📩 Your request has been submitted for approval.")
         await send_approval_request(update, context, state)
-        user_state.pop(user_id)
+        user_state.pop(user_id, None)
 
+# --- Admin approval ---
 async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
     user = update.effective_user
     group_id = state["group_id"]
@@ -162,9 +180,19 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         delta = float(state["days"])
         new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
 
-        admins = await context.bot.get_chat_administrators(group_id)
-        admin_message_refs[user.id] = []
+        # create a short token to keep callback_data <= 64 bytes
+        token = uuid.uuid4().hex[:10]
+        pending_requests[token] = {
+            "user_id": user.id,
+            "user_full_name": user.full_name,
+            "action": state["action"],
+            "days": state["days"],
+            "reason": state["reason"],
+            "group_id": group_id,
+        }
+        admin_message_refs[token] = []
 
+        admins = await context.bot.get_chat_administrators(group_id)
         for admin in admins:
             if admin.user.is_bot:
                 continue
@@ -182,99 +210,115 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{user.id}|{state['action']}|{state['days']}|{state['reason']}|{group_id}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{user.id}|{state['reason']}|{group_id}")
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{token}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{token}")
                     ]])
                 )
-                admin_message_refs[user.id].append((admin.user.id, msg.message_id))
+                admin_message_refs[token].append((admin.user.id, msg.message_id))
             except Exception as e:
                 logger.warning(f"⚠️ Cannot PM admin {admin.user.id}: {e}")
     except Exception:
         logger.exception("❌ Failed to fetch or notify admins")
 
+# --- Callback handler ---
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     try:
-        if data.startswith("approve|"):
-            _, user_id, action, days, reason, group_id = data.split("|")
-            now = datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            date = now.strftime("%Y-%m-%d")
+        if data.startswith("approve|") or data.startswith("deny|"):
+            action_type, token = data.split("|", maxsplit=1)
 
-            all_data = worksheet.get_all_values()
-            rows = [row for row in all_data if row[1] == str(user_id)]
-            current_off = float(rows[-1][6]) if rows else 0.0
-            delta = float(days)
-            final = current_off + delta if action == "clockoff" else current_off - delta
-            add_subtract = f"+{delta}" if action == "clockoff" else f"-{delta}"
+            # Retrieve request by token
+            req = pending_requests.get(token)
+            if not req:
+                await query.edit_message_text("⚠️ This request has expired or was already handled.")
+                return
 
-            worksheet.append_row([
-                date, str(user_id), "", action.title().replace("off", " Off"),
-                f"{current_off:.1f}", add_subtract, f"{final:.1f}",
-                query.from_user.full_name, reason, timestamp
-            ])
+            user_id = str(req["user_id"])
+            user_full_name = req.get("user_full_name") or user_id
+            action = req["action"]
+            days = float(req["days"])
+            reason = req["reason"]
+            group_id = int(req["group_id"])
 
-            # --- NEW: Resolve user's display name for group announcement ---
-            display_name = str(user_id)
-            try:
-                member = await context.bot.get_chat_member(int(group_id), int(user_id))
-                if member and member.user:
-                    # Prefer full name; fallback to @username; finally user_id
-                    if member.user.full_name:
-                        display_name = member.user.full_name
-                    elif member.user.username:
-                        display_name = f"@{member.user.username}"
-            except Exception as e:
-                logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
+            if action_type == "approve":
+                now = datetime.now()
+                timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                date = now.strftime("%Y-%m-%d")
 
-            await query.edit_message_text("✅ Request approved and recorded.")
-            await context.bot.send_message(
-                chat_id=int(group_id),
-                text=(
-                    f"✅ {display_name}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n"
-                    f"📅 Days: {days}\n"
-                    f"📝 Reason: {reason}\n"
-                    f"📊 Final: {final:.1f} day(s)"
+                all_data = worksheet.get_all_values()
+                rows = [row for row in all_data if row[1] == user_id]
+                current_off = float(rows[-1][6]) if rows else 0.0
+                final = current_off + days if action == "clockoff" else current_off - days
+                add_subtract = f"+{days}" if action == "clockoff" else f"-{days}"
+
+                worksheet.append_row([
+                    date, user_id, user_full_name,
+                    "Clock Off" if action == "clockoff" else "Claim Off",
+                    f"{current_off:.1f}", add_subtract, f"{final:.1f}",
+                    query.from_user.full_name, reason, timestamp
+                ])
+
+                # Resolve display name for group announcement
+                display_name = user_full_name or user_id
+                try:
+                    member = await context.bot.get_chat_member(group_id, int(user_id))
+                    if member and member.user:
+                        if member.user.full_name:
+                            display_name = member.user.full_name
+                        elif member.user.username:
+                            display_name = f"@{member.user.username}"
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
+
+                await query.edit_message_text("✅ Request approved and recorded.")
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=(
+                        f"✅ {display_name}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n"
+                        f"📅 Days: {days}\n"
+                        f"📝 Reason: {reason}\n"
+                        f"📊 Final: {final:.1f} day(s)"
+                    )
                 )
-            )
+            else:
+                # deny
+                # Resolve display name for group announcement
+                display_name = user_full_name or user_id
+                try:
+                    member = await context.bot.get_chat_member(group_id, int(user_id))
+                    if member and member.user:
+                        if member.user.full_name:
+                            display_name = member.user.full_name
+                        elif member.user.username:
+                            display_name = f"@{member.user.username}"
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
 
-        elif data.startswith("deny|"):
-            _, user_id, reason, group_id = data.split("|")
+                await query.edit_message_text("❌ Request denied.")
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=f"❌ {display_name}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
+                )
 
-            # --- NEW: Resolve user's display name for group announcement ---
-            display_name = str(user_id)
-            try:
-                member = await context.bot.get_chat_member(int(group_id), int(user_id))
-                if member and member.user:
-                    if member.user.full_name:
-                        display_name = member.user.full_name
-                    elif member.user.username:
-                        display_name = f"@{member.user.username}"
-            except Exception as e:
-                logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
+            # Clean up all admin messages for this token
+            if token in admin_message_refs:
+                for admin_id, msg_id in admin_message_refs[token]:
+                    if admin_id != query.from_user.id:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=admin_id,
+                                message_id=msg_id,
+                                text=f"⚠️ Request already handled by {query.from_user.full_name}.",
+                            )
+                        except Exception:
+                            pass
+                del admin_message_refs[token]
 
-            await query.edit_message_text("❌ Request denied.")
-            await context.bot.send_message(
-                chat_id=int(group_id),
-                text=f"❌ {display_name}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
-            )
-
-        # Clean up all admin messages (kept as-is per working structure)
-        if user_id in admin_message_refs:
-            for admin_id, msg_id in admin_message_refs[user_id]:
-                if admin_id != query.from_user.id:
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=admin_id,
-                            message_id=msg_id,
-                            text=f"⚠️ Request already handled by {query.from_user.full_name}.",
-                        )
-                    except Exception:
-                        pass
-            del admin_message_refs[user_id]
+            # Remove the pending request
+            pending_requests.pop(token, None)
 
     except Exception:
         logger.exception("❌ Failed to process callback")
