@@ -4,7 +4,6 @@ import asyncio
 import nest_asyncio
 import gspread
 import uuid
-import calendar
 from flask import Flask, request
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
@@ -18,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, date as dt_date
+from datetime import datetime, timedelta
 
 # --- Logging ---
 logging.basicConfig(
@@ -52,82 +51,31 @@ loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 
 # conversational state per user while filling the form
-# user_state[user_id] = { action, stage, days, app_date, reason, group_id, calendar_year, calendar_month, calendar_message_id }
+# { user_id: { action, stage, days, app_date, reason, group_id } }
 user_state = {}
 
 # pending approval requests stored server-side to keep callback_data short
-# token -> {user_id, user_full_name, action, days, reason, group_id, app_date, (mass=True, targets=[...])}
+# token -> {user_id, user_full_name, action, days, app_date, reason, group_id, is_holiday}
 pending_requests = {}
 
 # track admin PMs per token to clean up when one admin handles it
 # token -> [(admin_id, message_id), ...]
 admin_message_refs = {}
 
-# Sheet column indices (after append)
+# Column indices (0-based) for clarity when reading the sheet
 COL_TIMESTAMP = 0
 COL_TELEGRAM_ID = 1
 COL_NAME = 2
 COL_ACTION = 3
-COL_CURRENT_OFF = 4
+COL_CURR_OFF = 4
 COL_ADD_SUB = 5
 COL_FINAL_OFF = 6
 COL_APPROVED_BY = 7
 COL_APP_DATE = 8
 COL_REMARKS = 9
-COL_HOLIDAY_OFF = 10
-COL_EXPIRY = 11
-COL_PH_OFF_TOTAL = 12
-
-# --- Helpers: Calendar UI ---
-def _build_calendar(year: int, month: int) -> InlineKeyboardMarkup:
-    cal = calendar.Calendar(firstweekday=0)  # Monday
-    month_days = cal.monthdayscalendar(year, month)
-
-    header = f"{calendar.month_name[month]} {year}"
-    keyboard = [[InlineKeyboardButton(text=header, callback_data="noop")]]
-
-    keyboard.append([InlineKeyboardButton(d, callback_data="noop") for d in ["Mo","Tu","We","Th","Fr","Sa","Su"]])
-
-    for week in month_days:
-        row = []
-        for day in week:
-            if day == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="noop"))
-            else:
-                day_str = f"{year:04d}-{month:02d}-{day:02d}"
-                row.append(InlineKeyboardButton(str(day), callback_data=f"cal_pick|{day_str}"))
-        keyboard.append(row)
-
-    prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
-    next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
-
-    keyboard.append([
-        InlineKeyboardButton("◀ Prev", callback_data=f"cal_prev|{prev_year:04d}-{prev_month:02d}"),
-        InlineKeyboardButton("Type Manually", callback_data="cal_type"),
-        InlineKeyboardButton("Next ▶", callback_data=f"cal_next|{next_year:04d}-{next_month:02d}")
-    ])
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cal_cancel")])
-    return InlineKeyboardMarkup(keyboard)
-
-def _valid_yyyy_mm_dd(s: str) -> bool:
-    try:
-        datetime.strptime(s, "%Y-%m-%d")
-        return True
-    except Exception:
-        return False
-
-def _safe_float(s, default=0.0):
-    try:
-        return float(s)
-    except Exception:
-        return default
-
-async def _is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return bool(member and (member.status in ("administrator", "creator")))
-    except Exception:
-        return False
+COL_HOLIDAY = 10
+COL_PH_TOTAL = 11
+COL_EXPIRY = 12
 
 # --- Webhook ---
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
@@ -153,16 +101,45 @@ def _callback(fut):
     except Exception:
         logger.exception("❌ Exception in handler")
 
+# --- Utility ---
+MAX_REMARKS_LEN = 80
+
+def parse_date_yyyy_mm_dd(text: str) -> str | None:
+    try:
+        dt = datetime.strptime(text.strip(), "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def compute_expiry_from(app_date_str: str) -> str:
+    try:
+        base = datetime.strptime(app_date_str, "%Y-%m-%d")
+        expiry = base + timedelta(days=365)
+        return expiry.strftime("%Y-%m-%d")
+    except Exception:
+        return "N/A"
+
+async def get_current_off_for_user(user_id: str) -> float:
+    try:
+        all_data = worksheet.get_all_values()
+        rows = [row for row in all_data if len(row) > COL_TELEGRAM_ID and row[COL_TELEGRAM_ID] == str(user_id)]
+        if rows:
+            last = rows[-1]
+            return float(last[COL_FINAL_OFF]) if last[COL_FINAL_OFF] else 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read current off for {user_id}: {e}")
+    return 0.0
+
 # --- Commands ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛠️ *Oil Tracking Bot Help*\n\n"
         "/clockoff – Request to clock OIL\n"
         "/claimoff – Request to claim OIL\n"
-        "/clockphoff – Clock *Public Holiday* OIL (PH Off)\n"
-        "/claimphoff – Claim *Public Holiday* OIL (PH Off)\n"
-        "/massclockphoff – Admin: mass clock PH Off for all users found in the sheet\n"
-        "/summary – See OIL & PH OIL balances and your PH entries\n"
+        "/clockphoff – Request to clock Public Holiday OIL (+365d expiry)\n"
+        "/claimphoff – Request to claim Public Holiday OIL\n"
+        "/massclockphoff – Admin only: mass clock PH OIL (preview + confirm)\n"
+        "/summary – See your OIL & PH OIL details\n"
         "/history – See your past 5 OIL logs\n"
         "/help – Show this help message",
         parse_mode="Markdown"
@@ -172,43 +149,37 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == str(user.id)]
+        user_rows = [row for row in all_data if len(row) > COL_TELEGRAM_ID and row[COL_TELEGRAM_ID] == str(user.id)]
         if not user_rows:
             await update.message.reply_text("📊 No records found.")
             return
 
-        last_row = user_rows[-1]
-        normal_balance = last_row[COL_FINAL_OFF]
-        ph_total = last_row[COL_PH_OFF_TOTAL] if len(last_row) > COL_PH_OFF_TOTAL else "0"
+        # current overall off is last row's Final Off
+        balance = user_rows[-1][COL_FINAL_OFF] if len(user_rows[-1]) > COL_FINAL_OFF else "0.0"
 
-        today = dt_date.today()
-        active_entries = []
+        # PH breakdown
+        ph_entries = []
+        ph_total = 0.0
         for r in user_rows:
-            try:
-                is_ph_row = (len(r) > COL_HOLIDAY_OFF and r[COL_HOLIDAY_OFF].strip().lower() == "yes")
-                is_ph_clock = (len(r) > COL_ACTION and r[COL_ACTION].startswith("Clock Off (PH)"))
-                expiry_str = r[COL_EXPIRY] if len(r) > COL_EXPIRY else "N/A"
-                if is_ph_row and is_ph_clock and expiry_str and expiry_str != "N/A":
-                    exp_dt = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-                    if exp_dt >= today:
-                        app_date = r[COL_APP_DATE] if len(r) > COL_APP_DATE else "-"
-                        remark = r[COL_REMARKS] if len(r) > COL_REMARKS else ""
-                        active_entries.append((app_date, expiry_str, remark))
-            except Exception:
-                continue
+            if len(r) > COL_HOLIDAY and (r[COL_HOLIDAY] or "").strip().lower() == "yes":
+                app_date = r[COL_APP_DATE] if len(r) > COL_APP_DATE else "-"
+                add_sub = r[COL_ADD_SUB] if len(r) > COL_ADD_SUB else "0"
+                expiry = r[COL_EXPIRY] if len(r) > COL_EXPIRY else "N/A"
+                remarks = r[COL_REMARKS] if len(r) > COL_REMARKS else ""
+                ph_entries.append(f"• {app_date}: {add_sub} (exp {expiry}) {('- ' + remarks) if remarks else ''}")
+                try:
+                    # For total, sum deltas where Holiday Off == Yes
+                    ph_total += float(add_sub)
+                except Exception:
+                    pass
 
-        lines = [
-            f"📊 Balances:",
-            f"• Normal Off: {normal_balance} day(s)",
-            f"• PH Off: {ph_total} day(s)"
-        ]
-        if active_entries:
-            lines.append("\n🏝️ Your active PH entries:")
-            for app, exp, rem in active_entries:
-                rem_part = f" — {rem}" if rem else ""
-                lines.append(f"• {app} → expires {exp}{rem_part}")
+        lines = [f"📊 Current Off Balance: {balance} day(s)."]
+        if ph_entries:
+            lines.append(f"🏖 PH Off Total: {ph_total:.1f} day(s)")
+            lines.append("🔎 PH Off Entries:")
+            lines.extend(ph_entries)
         else:
-            lines.append("\n🏝️ No active PH entries.")
+            lines.append("🏖 PH Off Total: 0.0 day(s)")
 
         await update.message.reply_text("\n".join(lines))
     except Exception:
@@ -219,13 +190,17 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
         all_data = worksheet.get_all_values()
-        user_rows = [row for row in all_data if row[COL_TELEGRAM_ID] == str(user.id)]
+        user_rows = [row for row in all_data if len(row) > COL_TELEGRAM_ID and row[COL_TELEGRAM_ID] == str(user.id)]
         if user_rows:
             last_5 = user_rows[-5:]
-            response = "\n".join([
-                f"{row[COL_TIMESTAMP]} | {row[COL_ACTION]} | {row[COL_ADD_SUB]} → {row[COL_FINAL_OFF]} | App: {row[COL_APP_DATE]} | {row[COL_REMARKS]}"
-                for row in last_5
-            ])
+            def rowline(row):
+                ts = row[COL_TIMESTAMP] if len(row) > COL_TIMESTAMP else ""
+                act = row[COL_ACTION] if len(row) > COL_ACTION else ""
+                add = row[COL_ADD_SUB] if len(row) > COL_ADD_SUB else ""
+                fin = row[COL_FINAL_OFF] if len(row) > COL_FINAL_OFF else ""
+                appd= row[COL_APP_DATE] if len(row) > COL_APP_DATE else ""
+                return f"{ts} | {act} | {add} → {fin} | AppDate: {appd}"
+            response = "\n".join(rowline(r) for r in last_5)
             await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
         else:
             await update.message.reply_text("📜 No logs found.")
@@ -233,168 +208,120 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("❌ Failed to fetch history")
         await update.message.reply_text("❌ Could not retrieve your logs.")
 
+# --- Entry commands (start conversation) ---
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "clockoff", "stage": "awaiting_days"}
-    await update.message.reply_text("🕒 How many do you want to *clock off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    await update.message.reply_text("🕒 How many days do you want to clock off? (0.5 to 3, in 0.5 increments)")
 
 async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimoff", "stage": "awaiting_days"}
-    await update.message.reply_text("🧾 How many do you want to *claim off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    await update.message.reply_text("🧾 How many days do you want to claim off? (0.5 to 3, in 0.5 increments)")
 
 async def clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_state[update.effective_user.id] = {"action": "clockph", "stage": "awaiting_days"}
-    await update.message.reply_text("🏝️ How many *PH Off* days to *clock*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    user_state[update.effective_user.id] = {"action": "clockphoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🏖 How many PH off days to clock? (0.5 to 3, in 0.5 increments)")
 
 async def claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_state[update.effective_user.id] = {"action": "claimph", "stage": "awaiting_days"}
-    await update.message.reply_text("🏝️ How many *PH Off* days to *claim*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    user_state[update.effective_user.id] = {"action": "claimphoff", "stage": "awaiting_days"}
+    await update.message.reply_text("🏖 How many PH off days to claim? (0.5 to 3, in 0.5 increments)")
 
-# --- NEW: Admin mass clock PH Off ---
+# Admin-only mass clock PH off
 async def massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    if not await _is_admin(context, chat_id, user_id):
-        await update.message.reply_text("⛔ Only admins can use /massclockphoff.")
+    chat = update.effective_chat
+    user = update.effective_user
+    # check admin
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        admin_ids = {a.user.id for a in admins}
+        if user.id not in admin_ids:
+            await update.message.reply_text("⛔ Admins only.")
+            return
+    except Exception:
+        await update.message.reply_text("⛔ Unable to verify admin status.")
         return
-    user_state[user_id] = {"action": "massclockph", "stage": "awaiting_days", "group_id": chat_id}
-    await update.message.reply_text("🏝️ Admin: How many *PH Off* days to *clock for everyone*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+
+    user_state[user.id] = {"action": "massclockph", "stage": "awaiting_days", "group_id": chat.id}
+    await update.message.reply_text("🏖 Mass clock PH Off — how many days? (0.5 to 3, in 0.5 increments)")
 
 # --- Conversation state machine ---
-MAX_REMARKS_LEN = 80
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    message = update.message.text.strip()
+    text = update.message.text.strip()
 
     if user_id not in user_state:
         return
 
     state = user_state[user_id]
+    action = state["action"]
 
+    # 1) days
     if state["stage"] == "awaiting_days":
         try:
-            days = float(message)
+            days = float(text)
             if days < 0.5 or days > 3 or (days * 10) % 5 != 0:
                 raise ValueError()
             state["days"] = days
-            state["stage"] = "awaiting_date"
-            today = dt_date.today()
-            state["calendar_year"] = today.year
-            state["calendar_month"] = today.month
-            sent = await update.message.reply_text(
-                "📅 Select the *Application Date* from the calendar below, or tap *Type Manually* to enter a date (YYYY-MM-DD).",
-                parse_mode="Markdown",
-                reply_markup=_build_calendar(today.year, today.month)
-            )
-            state["calendar_message_id"] = sent.message_id
+            state["stage"] = "awaiting_app_date"
+            await update.message.reply_text("📅 Application Date? (YYYY-MM-DD)")
         except ValueError:
             await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 to 3 (0.5 steps).")
+        return
 
-    elif state["stage"] == "awaiting_manual_date":
-        if not _valid_yyyy_mm_dd(message):
-            await update.message.reply_text("❌ Invalid date format. Please use YYYY-MM-DD.")
+    # 2) application date
+    if state["stage"] == "awaiting_app_date":
+        app_date = parse_date_yyyy_mm_dd(text)
+        if not app_date:
+            await update.message.reply_text("❌ Invalid date. Please use YYYY-MM-DD (e.g., 2025-08-07).")
             return
-        state["app_date"] = message
+        state["app_date"] = app_date
         state["stage"] = "awaiting_reason"
         await update.message.reply_text(f"📝 What's the reason? (Max {MAX_REMARKS_LEN} characters)")
+        return
 
-    elif state["stage"] == "awaiting_reason":
-        reason = message
+    # 3) reason
+    if state["stage"] == "awaiting_reason":
+        reason = text
         if len(reason) > MAX_REMARKS_LEN:
             reason = reason[:MAX_REMARKS_LEN]
             await update.message.reply_text(f"✂️ Remarks trimmed to {MAX_REMARKS_LEN} characters.")
         state["reason"] = reason
+        state["group_id"] = update.message.chat_id
 
-        # For personal flows, save group id from the message chat
-        if "group_id" not in state:
-            state["group_id"] = update.message.chat_id
+        # Mass flow preview
+        if action == "massclockph":
+            await send_mass_ph_preview(update, context, state)
+        else:
+            await update.message.reply_text("📩 Your request has been submitted for approval.")
+            await send_approval_request(update, context, state)
 
-        await update.message.reply_text("📩 Your request has been submitted for approval.")
-        await send_approval_request(update, context, state)
         user_state.pop(user_id, None)
+        return
 
-# --- Admin approval ---
+# --- Admin approval (single user flows) ---
 async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
     user = update.effective_user
     group_id = state["group_id"]
+
     try:
-        all_data = worksheet.get_all_values()
-
-        if state["action"] == "massclockph":
-            # Build target list from the sheet (unique Telegram IDs)
-            targets = {}
-            for r in all_data:
-                if len(r) > COL_TELEGRAM_ID and r[COL_TELEGRAM_ID].strip():
-                    uid = r[COL_TELEGRAM_ID].strip()
-                    name = r[COL_NAME] if len(r) > COL_NAME else ""
-                    targets[uid] = name
-            target_pairs = [(uid, targets[uid]) for uid in targets.keys()]
-            count = len(target_pairs)
-
-            token = uuid.uuid4().hex[:10]
-            pending_requests[token] = {
-                "user_id": user.id,
-                "user_full_name": user.full_name,
-                "action": state["action"],
-                "days": state["days"],
-                "reason": state["reason"],
-                "group_id": group_id,
-                "app_date": state.get("app_date", ""),
-                "mass": True,
-                "targets": target_pairs,  # list of (telegram_id_str, name_str)
-            }
-            admin_message_refs[token] = []
-
-            # PM only the invoking admin for approval (avoid spamming all admins)
-            try:
-                msg = await context.bot.send_message(
-                    chat_id=user.id,
-                    text=(
-                        f"🆕 *Mass Clock PH Off* Request\n\n"
-                        f"👤 By: {user.full_name}\n"
-                        f"👥 Targets: {count} users (from sheet)\n"
-                        f"📅 Days: {state['days']}\n"
-                        f"📅 Application Date: {state.get('app_date','') or '-'}\n"
-                        f"📝 Reason: {state['reason']}\n\n"
-                        "Choose: *Preview*, *Approve* or *Deny*."
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("👀 Preview", callback_data=f"preview|{token}"),
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{token}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{token}")
-                    ]])
-                )
-                admin_message_refs[token].append((user.id, msg.message_id))
-            except Exception as e:
-                logger.warning(f"⚠️ Cannot PM admin {user.id}: {e}")
-            return
-
-        # Personal request path (existing)
-        user_rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == str(user.id)]
-        current_off = _safe_float(user_rows[-1][COL_FINAL_OFF]) if user_rows else 0.0
-
+        current_off = await get_current_off_for_user(str(user.id))
         delta = float(state["days"])
-        is_ph = state["action"] in ("clockph", "claimph")
+        new_off = current_off + delta if state["action"] in ("clockoff", "clockphoff") else current_off - delta
 
-        if is_ph:
-            new_off = current_off
-            last_ph = _safe_float(user_rows[-1][COL_PH_OFF_TOTAL], 0.0) if (user_rows and len(user_rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
-            new_ph = last_ph + delta if state["action"] == "clockph" else last_ph - delta
-            ph_note = f"\n🏝️ PH Off Total → {last_ph:.1f} ➜ {new_ph:.1f}"
-        else:
-            new_off = current_off + delta if state["action"] == "clockoff" else current_off - delta
-            ph_note = ""
+        is_holiday = state["action"] in ("clockphoff", "claimphoff")
+        app_date = state["app_date"]
+        expiry = compute_expiry_from(app_date) if is_holiday and state["action"] == "clockphoff" else "N/A"
 
+        # create a short token to keep callback_data <= 64 bytes
         token = uuid.uuid4().hex[:10]
         pending_requests[token] = {
             "user_id": user.id,
             "user_full_name": user.full_name,
             "action": state["action"],
             "days": state["days"],
+            "app_date": app_date,
             "reason": state["reason"],
             "group_id": group_id,
-            "app_date": state.get("app_date", ""),
+            "is_holiday": is_holiday,
         }
         admin_message_refs[token] = []
 
@@ -406,13 +333,15 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                 msg = await context.bot.send_message(
                     chat_id=admin.user.id,
                     text=(
-                        f"🆕 *{state['action'].replace('ph',' PH').title()}* Request\n\n"
-                        f"👤 User: {user.full_name}\n"
+                        f"🆕 *{state['action'].title()} Request*\n\n"
+                        f"👤 User: {user.full_name} ({user.id})\n"
                         f"📅 Days: {state['days']}\n"
-                        f"📅 Application Date: {state.get('app_date','') or '-'}\n"
+                        f"📆 App Date: {app_date}\n"
                         f"📝 Reason: {state['reason']}\n\n"
-                        f"📊 Current Off: {current_off:.1f} day(s)\n"
-                        f"📈 New Balance: {new_off:.1f} day(s){ph_note}\n\n"
+                        f"🏷 Holiday Off: {'Yes' if is_holiday else 'No'}"
+                        + (f"\n⏳ Expiry: {expiry}" if expiry != 'N/A' else "") +
+                        f"\n\n📊 Current Off: {current_off:.1f} day(s)\n"
+                        f"📈 New Balance: {new_off:.1f} day(s)\n\n"
                         "✅ Approve or ❌ Deny?"
                     ),
                     parse_mode="Markdown",
@@ -427,87 +356,79 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("❌ Failed to fetch or notify admins")
 
+# --- Mass PH preview and confirm ---
+async def send_mass_ph_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, state):
+    group_id = state["group_id"]
+    days = state["days"]
+    app_date = state["app_date"]
+    reason = state["reason"]
+
+    # Build target list from the sheet (unique Telegram IDs), skip headers/non-numeric IDs
+    try:
+        all_data = worksheet.get_all_values()
+    except Exception:
+        logger.exception("❌ Failed to read sheet for mass preview")
+        await update.message.reply_text("❌ Failed to read the sheet.")
+        return
+
+    targets = {}
+    for r in all_data:
+        if len(r) <= COL_TELEGRAM_ID:
+            continue
+        uid = (r[COL_TELEGRAM_ID] or "").strip()
+        name = (r[COL_NAME] if len(r) > COL_NAME else "").strip()
+
+        headerish = {"telegram id", "id"}
+        name_headerish = {"name", "user", "name (telegram id)"}
+
+        if uid.lower() in headerish or name.lower() in name_headerish:
+            continue
+        if not uid.isdigit():
+            continue
+
+        targets[uid] = name or "-"
+
+    target_pairs = sorted(((uid, targets[uid]) for uid in targets.keys()),
+                          key=lambda x: (x[1].lower(), x[0]))
+    count = len(target_pairs)
+
+    if count == 0:
+        await update.message.reply_text("⚠️ No users found in the sheet to mass clock.")
+        return
+
+    # Store mass request by token
+    token = uuid.uuid4().hex[:10]
+    pending_requests[token] = {
+        "action": "massclockph_confirm",
+        "group_id": group_id,
+        "days": days,
+        "app_date": app_date,
+        "reason": reason,
+        "targets": target_pairs,  # list of (uid, name)
+    }
+
+    preview_lines = ["🔎 *Mass PH Off Preview* (Name — Telegram ID)"]
+    preview_lines += [f"- {name} ({uid})" for uid, name in target_pairs[:50]]
+    if count > 50:
+        preview_lines.append(f"... and {count - 50} more.")
+
+    await update.message.reply_text(
+        "\n".join(preview_lines) + f"\n\nDays: {days}\nApp Date: {app_date}\nReason: {reason}\n\nProceed?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"massconfirm|{token}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"masscancel|{token}")
+        ]])
+    )
+
 # --- Callback handler ---
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    cb_from_user_id = query.from_user.id
 
     try:
-        # Calendar nav/selection for conversational users
-        st = user_state.get(cb_from_user_id)
-        if data.startswith("cal_prev|") or data.startswith("cal_next|"):
-            if not st or st.get("stage") != "awaiting_date":
-                return
-            _, y_m = data.split("|", maxsplit=1)
-            y, m = map(int, y_m.split("-"))
-            st["calendar_year"], st["calendar_month"] = y, m
-            await query.edit_message_reply_markup(reply_markup=_build_calendar(y, m))
-            return
-
-        if data.startswith("cal_pick|"):
-            if not st or st.get("stage") != "awaiting_date":
-                return
-            _, picked = data.split("|", maxsplit=1)
-            if not _valid_yyyy_mm_dd(picked):
-                await query.edit_message_text("❌ Invalid date picked.")
-                return
-            st["app_date"] = picked
-            st["stage"] = "awaiting_reason"
-            await query.edit_message_text(
-                f"📅 Application Date selected: *{picked}*.\n\n📝 Now enter the *reason* (max {MAX_REMARKS_LEN} chars).",
-                parse_mode="Markdown"
-            )
-            return
-
-        if data == "cal_type":
-            if not st or st.get("stage") != "awaiting_date":
-                return
-            st["stage"] = "awaiting_manual_date"
-            await query.edit_message_text("⌨️ Please *type* the Application Date in the format: YYYY-MM-DD", parse_mode="Markdown")
-            return
-
-        if data == "cal_cancel":
-            if st:
-                user_state.pop(cb_from_user_id, None)
-            await query.edit_message_text("❎ Cancelled.")
-            return
-
-        # Preview for mass
-        if data.startswith("preview|"):
-            _, token = data.split("|", maxsplit=1)
-            req = pending_requests.get(token)
-            if not req or not req.get("mass"):
-                await query.edit_message_text("⚠️ Nothing to preview for this request.")
-                return
-
-            targets = req.get("targets", [])
-            if not targets:
-                await context.bot.send_message(chat_id=cb_from_user_id, text="(No targets found in sheet.)")
-            else:
-                # chunk preview under Telegram 4096 limit
-                lines = [f"👀 Preview ({len(targets)} users):"]
-                chunks = []
-                current = ""
-                for uid, name in targets:
-                    line = f"- {name or '-'} ({uid})\n"
-                    if len(current) + len(line) > 3500:  # safety margin
-                        chunks.append(current)
-                        current = line
-                    else:
-                        current += line
-                if current:
-                    chunks.append(current)
-
-                for i, ch in enumerate(chunks, 1):
-                    header = f"👀 Preview {i}/{len(chunks)}"
-                    await context.bot.send_message(chat_id=cb_from_user_id, text=f"{header}\n{ch}")
-
-            # keep the original message with buttons
-            return
-
-        # Approvals / Denials (mass & personal)
+        # Single-user approve/deny
         if data.startswith("approve|") or data.startswith("deny|"):
             action_type, token = data.split("|", maxsplit=1)
             req = pending_requests.get(token)
@@ -515,188 +436,72 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ This request has expired or was already handled.")
                 return
 
-            is_mass = req.get("mass", False)
-
-            if is_mass:
-                # Mass PH clock
-                if action_type == "approve":
-                    app_date = req.get("app_date", "")
-                    try:
-                        app_dt = datetime.strptime(app_date, "%Y-%m-%d").date()
-                        expiry_val = (app_dt + timedelta(days=365)).strftime("%Y-%m-%d")
-                    except Exception:
-                        expiry_val = "N/A"
-
-                    targets = req.get("targets", [])
-                    days = float(req["days"])
-                    reason = req["reason"]
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    appended = 0
-
-                    all_data = worksheet.get_all_values()
-                    last_by_user = {}
-                    for r in all_data:
-                        if len(r) > COL_TELEGRAM_ID and r[COL_TELEGRAM_ID].strip():
-                            last_by_user[r[COL_TELEGRAM_ID]] = r
-
-                    for uid, name in targets:
-                        last_row = last_by_user.get(uid)
-                        current_off = _safe_float(last_row[COL_FINAL_OFF]) if last_row else 0.0
-                        last_ph_total = _safe_float(last_row[COL_PH_OFF_TOTAL], 0.0) if (last_row and len(last_row) > COL_PH_OFF_TOTAL) else 0.0
-                        new_ph_total = last_ph_total + days
-
-                        worksheet.append_row([
-                            timestamp,
-                            uid,
-                            name or "-",
-                            "Clock Off (PH)",
-                            f"{current_off:.1f}",
-                            "+0",
-                            f"{current_off:.1f}",
-                            query.from_user.full_name,
-                            app_date or "-",
-                            reason,
-                            "Yes",
-                            expiry_val,
-                            f"{new_ph_total:.1f}"
-                        ])
-                        appended += 1
-
-                    await query.edit_message_text(f"✅ Mass PH Off clocked for {appended} users.")
-                    await context.bot.send_message(
-                        chat_id=req["group_id"],
-                        text=(
-                            f"✅ *Mass Clock PH Off* approved by {query.from_user.full_name}.\n"
-                            f"👥 Users updated: {appended}\n"
-                            f"📅 Days: {days}\n"
-                            f"📅 Application Date: {app_date or '-'}\n"
-                            f"📝 Reason: {reason}"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await query.edit_message_text("❌ Mass request denied.")
-                    await context.bot.send_message(
-                        chat_id=req["group_id"],
-                        text=f"❌ Mass PH Off clock was denied by {query.from_user.full_name}."
-                    )
-
-                # Clean up admin PMs for this token
-                if token in admin_message_refs:
-                    for admin_id, msg_id in admin_message_refs[token]:
-                        if admin_id != query.from_user.id:
-                            try:
-                                await context.bot.edit_message_text(
-                                    chat_id=admin_id,
-                                    message_id=msg_id,
-                                    text=f"⚠️ Request already handled by {query.from_user.full_name}.",
-                                )
-                            except Exception:
-                                pass
-                    del admin_message_refs[token]
-
-                pending_requests.pop(token, None)
+            # Distinguish mass request early
+            if req.get("action") == "massclockph_confirm":
+                await query.edit_message_text("⚠️ Use the mass confirm/cancel buttons for the mass request.")
                 return
 
-            # --- Personal flows (existing) ---
-            req_user_id = str(req["user_id"])
-            user_full_name = req.get("user_full_name") or req_user_id
-            action = req["action"]  # 'clockoff' | 'claimoff' | 'clockph' | 'claimph'
+            user_id = str(req["user_id"])
+            user_full_name = req.get("user_full_name") or user_id
+            action = req["action"]
             days = float(req["days"])
+            app_date = req["app_date"]
             reason = req["reason"]
             group_id = int(req["group_id"])
-            app_date = req.get("app_date", "")
+            is_holiday = bool(req.get("is_holiday"))
 
-            all_data = worksheet.get_all_values()
-            rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == req_user_id]
-            current_off = _safe_float(rows[-1][COL_FINAL_OFF]) if rows else 0.0
-            last_ph_total = _safe_float(rows[-1][COL_PH_OFF_TOTAL], 0.0) if (rows and len(rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
-
-            is_ph = action in ("clockph", "claimph")
+            # Resolve display name for group announcement
+            display_name = user_full_name or user_id
+            try:
+                member = await context.bot.get_chat_member(group_id, int(user_id))
+                if member and member.user:
+                    if member.user.full_name:
+                        display_name = member.user.full_name
+                    elif member.user.username:
+                        display_name = f"@{member.user.username}"
+            except Exception as e:
+                logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
 
             if action_type == "approve":
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                current_off = await get_current_off_for_user(user_id)
+                final = current_off + days if action in ("clockoff", "clockphoff") else current_off - days
+                add_subtract = f"+{days}" if action in ("clockoff", "clockphoff") else f"-{days}"
+                expiry = compute_expiry_from(app_date) if (is_holiday and action == "clockphoff") else "N/A"
+                holiday_flag = "Yes" if is_holiday else "No"
+                ph_total_val = f"{days}" if is_holiday else "N/A"
 
-                if is_ph:
-                    final_off = current_off
-                    add_subtract = "+0"
-                    holiday_flag = "Yes"
-                    new_ph_total = last_ph_total + days if action == "clockph" else last_ph_total - days
-                    expiry = "N/A"
-                    if action == "clockph":
-                        try:
-                            app_dt = datetime.strptime(app_date, "%Y-%m-%d").date()
-                            expiry = (app_dt + timedelta(days=365)).strftime("%Y-%m-%d")
-                        except Exception:
-                            expiry = "N/A"
-                else:
-                    final_off = current_off + days if action == "clockoff" else current_off - days
-                    add_subtract = f"+{days}" if action == "clockoff" else f"-{days}"
-                    holiday_flag = "No"
-                    expiry = "N/A"
-                    new_ph_total = last_ph_total
-
+                # Append with new order:
+                # Timestamp, Telegram ID, Name, Action, Current Off, Add/Subtract, Final Off,
+                # Approved By, Application Date, Remarks, Holiday Off, PH Off Total, Expiry
                 worksheet.append_row([
-                    timestamp,
-                    req_user_id,
-                    user_full_name,
-                    ("Clock Off" if action in ("clockoff", "clockph") else "Claim Off") + (" (PH)" if is_ph else ""),
-                    f"{current_off:.1f}",
-                    add_subtract,
-                    f"{final_off:.1f}",
-                    query.from_user.full_name,
-                    app_date or "-",
-                    reason,
-                    holiday_flag,
-                    expiry,
-                    f"{new_ph_total:.1f}"
+                    timestamp, user_id, display_name,
+                    ("Clock Off" if action in ("clockoff", "clockphoff") else "Claim Off"),
+                    f"{current_off:.1f}", add_subtract, f"{final:.1f}",
+                    query.from_user.full_name, app_date, reason, holiday_flag, ph_total_val, expiry
                 ])
 
-                display_name = user_full_name or req_user_id
-                try:
-                    member = await context.bot.get_chat_member(group_id, int(req_user_id))
-                    if member and member.user:
-                        if member.user.full_name:
-                            display_name = member.user.full_name
-                        elif member.user.username:
-                            display_name = f"@{member.user.username}"
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not resolve name for {req_user_id} in group {group_id}: {e}")
-
                 await query.edit_message_text("✅ Request approved and recorded.")
-                details = [
-                    f"✅ {display_name}'s {(action.replace('ph',' PH').replace('off',' Off'))} approved by {query.from_user.full_name}.",
-                    f"📅 Days: {days}",
-                    f"📅 Application Date: {app_date or '-'}",
-                    f"📝 Reason: {reason}",
-                ]
-                if is_ph:
-                    details.append(f"🏝️ PH Off Total: {new_ph_total:.1f} day(s)")
-                    if expiry != "N/A":
-                        details.append(f"⏳ Expiry: {expiry}")
-                    details.append(f"📊 Final Off (normal): {final_off:.1f} day(s)")
-                else:
-                    details.append(f"📊 Final Off: {final_off:.1f} day(s)")
-
-                await context.bot.send_message(chat_id=group_id, text="\n".join(details))
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=(
+                        f"✅ {display_name}'s {('PH ' if is_holiday else '')}{action.replace('off',' Off')} "
+                        f"approved by {query.from_user.full_name}.\n"
+                        f"📅 Days: {days}\n"
+                        f"📆 App Date: {app_date}"
+                        + (f"\n⏳ Expiry: {expiry}" if expiry != "N/A" else "") +
+                        f"\n📝 Reason: {reason}\n"
+                        f"📊 Final: {final:.1f} day(s)"
+                    )
+                )
             else:
-                display_name = user_full_name or req_user_id
-                try:
-                    member = await context.bot.get_chat_member(group_id, int(req_user_id))
-                    if member and member.user:
-                        if member.user.full_name:
-                            display_name = member.user.full_name
-                        elif member.user.username:
-                            display_name = f"@{member.user.username}"
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not resolve name for {req_user_id} in group {group_id}: {e}")
-
                 await query.edit_message_text("❌ Request denied.")
                 await context.bot.send_message(
                     chat_id=group_id,
-                    text=f"❌ {display_name}'s {(action.replace('ph',' PH').replace('off',' Off'))} was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
+                    text=f"❌ {display_name}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
                 )
 
+            # Clean up all admin messages for this token
             if token in admin_message_refs:
                 for admin_id, msg_id in admin_message_refs[token]:
                     if admin_id != query.from_user.id:
@@ -710,7 +515,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             pass
                 del admin_message_refs[token]
 
+            # Remove the pending request
             pending_requests.pop(token, None)
+            return
+
+        # Mass confirm/cancel
+        if data.startswith("massconfirm|") or data.startswith("masscancel|"):
+            action_type, token = data.split("|", maxsplit=1)
+            req = pending_requests.get(token)
+            if not req:
+                await query.edit_message_text("⚠️ This mass request has expired or was already handled.")
+                return
+
+            if action_type == "masscancel":
+                pending_requests.pop(token, None)
+                await query.edit_message_text("🚫 Mass PH Off clocking canceled.")
+                return
+
+            # Confirm mass clock
+            group_id = int(req["group_id"])
+            days = float(req["days"])
+            app_date = req["app_date"]
+            reason = req["reason"]
+            targets = req["targets"]  # list of (uid, name)
+            expiry = compute_expiry_from(app_date)
+            count_success = 0
+            for uid, name in targets:
+                try:
+                    user_id = str(uid)
+                    display_name = name or user_id
+                    current_off = await get_current_off_for_user(user_id)
+                    final = current_off + days
+                    add_subtract = f"+{days}"
+
+                    worksheet.append_row([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id, display_name,
+                        "Clock Off",
+                        f"{current_off:.1f}", add_subtract, f"{final:.1f}",
+                        query.from_user.full_name, app_date, reason, "Yes", f"{days}", expiry
+                    ])
+                    count_success += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to append for {uid}: {e}")
+
+            pending_requests.pop(token, None)
+            await query.edit_message_text(f"✅ Mass PH Off clocked for {count_success} member(s).")
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=f"🏖 PH Off clocked for {count_success} member(s).\nDays: {days} | App Date: {app_date} | Expiry: {expiry}"
+            )
             return
 
     except Exception:
