@@ -52,13 +52,11 @@ loop = asyncio.new_event_loop()
 executor = ThreadPoolExecutor()
 
 # conversational state per user while filling the form
-# user_state[user_id] = {
-#   action, stage, days, app_date, reason, group_id, calendar_year, calendar_month, calendar_message_id
-# }
+# user_state[user_id] = { action, stage, days, app_date, reason, group_id, calendar_year, calendar_month, calendar_message_id }
 user_state = {}
 
 # pending approval requests stored server-side to keep callback_data short
-# token -> {user_id, user_full_name, action, days, reason, group_id, app_date}
+# token -> {user_id, user_full_name, action, days, reason, group_id, app_date, (mass=True, targets=[...])}
 pending_requests = {}
 
 # track admin PMs per token to clean up when one admin handles it
@@ -124,6 +122,13 @@ def _safe_float(s, default=0.0):
     except Exception:
         return default
 
+async def _is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return bool(member and (member.status in ("administrator", "creator")))
+    except Exception:
+        return False
+
 # --- Webhook ---
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -156,6 +161,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/claimoff – Request to claim OIL\n"
         "/clockphoff – Clock *Public Holiday* OIL (PH Off)\n"
         "/claimphoff – Claim *Public Holiday* OIL (PH Off)\n"
+        "/massclockphoff – Admin: mass clock PH Off for all users found in the sheet\n"
         "/summary – See OIL & PH OIL balances and your PH entries\n"
         "/history – See your past 5 OIL logs\n"
         "/help – Show this help message",
@@ -175,7 +181,6 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         normal_balance = last_row[COL_FINAL_OFF]
         ph_total = last_row[COL_PH_OFF_TOTAL] if len(last_row) > COL_PH_OFF_TOTAL else "0"
 
-        # Active PH entries: Holiday Off == "Yes" and Action == "Clock Off (PH)" and Expiry >= today
         today = dt_date.today()
         active_entries = []
         for r in user_rows:
@@ -230,11 +235,11 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "clockoff", "stage": "awaiting_days"}
-    await update.message.reply_text("🕒 How many days do you want to *clock off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    await update.message.reply_text("🕒 How many do you want to *clock off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
 async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimoff", "stage": "awaiting_days"}
-    await update.message.reply_text("🧾 How many days do you want to *claim off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+    await update.message.reply_text("🧾 How many do you want to *claim off*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
 async def clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "clockph", "stage": "awaiting_days"}
@@ -243,6 +248,16 @@ async def clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_user.id] = {"action": "claimph", "stage": "awaiting_days"}
     await update.message.reply_text("🏝️ How many *PH Off* days to *claim*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
+
+# --- NEW: Admin mass clock PH Off ---
+async def massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not await _is_admin(context, chat_id, user_id):
+        await update.message.reply_text("⛔ Only admins can use /massclockphoff.")
+        return
+    user_state[user_id] = {"action": "massclockph", "stage": "awaiting_days", "group_id": chat_id}
+    await update.message.reply_text("🏝️ Admin: How many *PH Off* days to *clock for everyone*? (0.5 to 3, in 0.5 increments)", parse_mode="Markdown")
 
 # --- Conversation state machine ---
 MAX_REMARKS_LEN = 80
@@ -289,7 +304,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason = reason[:MAX_REMARKS_LEN]
             await update.message.reply_text(f"✂️ Remarks trimmed to {MAX_REMARKS_LEN} characters.")
         state["reason"] = reason
-        state["group_id"] = update.message.chat_id
+
+        # For personal flows, save group id from the message chat
+        if "group_id" not in state:
+            state["group_id"] = update.message.chat_id
+
         await update.message.reply_text("📩 Your request has been submitted for approval.")
         await send_approval_request(update, context, state)
         user_state.pop(user_id, None)
@@ -300,6 +319,58 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
     group_id = state["group_id"]
     try:
         all_data = worksheet.get_all_values()
+
+        if state["action"] == "massclockph":
+            # Build target list from the sheet (unique Telegram IDs)
+            targets = {}
+            for r in all_data:
+                if len(r) > COL_TELEGRAM_ID and r[COL_TELEGRAM_ID].strip():
+                    uid = r[COL_TELEGRAM_ID].strip()
+                    name = r[COL_NAME] if len(r) > COL_NAME else ""
+                    targets[uid] = name
+            target_pairs = [(uid, targets[uid]) for uid in targets.keys()]
+            count = len(target_pairs)
+
+            token = uuid.uuid4().hex[:10]
+            pending_requests[token] = {
+                "user_id": user.id,
+                "user_full_name": user.full_name,
+                "action": state["action"],
+                "days": state["days"],
+                "reason": state["reason"],
+                "group_id": group_id,
+                "app_date": state.get("app_date", ""),
+                "mass": True,
+                "targets": target_pairs,  # list of (telegram_id_str, name_str)
+            }
+            admin_message_refs[token] = []
+
+            # PM only the invoking admin for approval (avoid spamming all admins)
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=user.id,
+                    text=(
+                        f"🆕 *Mass Clock PH Off* Request\n\n"
+                        f"👤 By: {user.full_name}\n"
+                        f"👥 Targets: {count} users (from sheet)\n"
+                        f"📅 Days: {state['days']}\n"
+                        f"📅 Application Date: {state.get('app_date','') or '-'}\n"
+                        f"📝 Reason: {state['reason']}\n\n"
+                        "Choose: *Preview*, *Approve* or *Deny*."
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("👀 Preview", callback_data=f"preview|{token}"),
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{token}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{token}")
+                    ]])
+                )
+                admin_message_refs[token].append((user.id, msg.message_id))
+            except Exception as e:
+                logger.warning(f"⚠️ Cannot PM admin {user.id}: {e}")
+            return
+
+        # Personal request path (existing)
         user_rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == str(user.id)]
         current_off = _safe_float(user_rows[-1][COL_FINAL_OFF]) if user_rows else 0.0
 
@@ -307,7 +378,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
         is_ph = state["action"] in ("clockph", "claimph")
 
         if is_ph:
-            new_off = current_off  # PH doesn't change normal off balance
+            new_off = current_off
             last_ph = _safe_float(user_rows[-1][COL_PH_OFF_TOTAL], 0.0) if (user_rows and len(user_rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
             new_ph = last_ph + delta if state["action"] == "clockph" else last_ph - delta
             ph_note = f"\n🏝️ PH Off Total → {last_ph:.1f} ➜ {new_ph:.1f}"
@@ -335,7 +406,7 @@ async def send_approval_request(update: Update, context: ContextTypes.DEFAULT_TY
                 msg = await context.bot.send_message(
                     chat_id=admin.user.id,
                     text=(
-                        f"🆕 *{state['action'].replace('ph',' PH').title()} Request*\n\n"
+                        f"🆕 *{state['action'].replace('ph',' PH').title()}* Request\n\n"
                         f"👤 User: {user.full_name}\n"
                         f"📅 Days: {state['days']}\n"
                         f"📅 Application Date: {state.get('app_date','') or '-'}\n"
@@ -364,7 +435,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb_from_user_id = query.from_user.id
 
     try:
-        # Calendar navigation & selection
+        # Calendar nav/selection for conversational users
         st = user_state.get(cb_from_user_id)
         if data.startswith("cal_prev|") or data.startswith("cal_next|"):
             if not st or st.get("stage") != "awaiting_date":
@@ -403,7 +474,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❎ Cancelled.")
             return
 
-        # Admin approve/deny
+        # Preview for mass
+        if data.startswith("preview|"):
+            _, token = data.split("|", maxsplit=1)
+            req = pending_requests.get(token)
+            if not req or not req.get("mass"):
+                await query.edit_message_text("⚠️ Nothing to preview for this request.")
+                return
+
+            targets = req.get("targets", [])
+            if not targets:
+                await context.bot.send_message(chat_id=cb_from_user_id, text="(No targets found in sheet.)")
+            else:
+                # chunk preview under Telegram 4096 limit
+                lines = [f"👀 Preview ({len(targets)} users):"]
+                chunks = []
+                current = ""
+                for uid, name in targets:
+                    line = f"- {name or '-'} ({uid})\n"
+                    if len(current) + len(line) > 3500:  # safety margin
+                        chunks.append(current)
+                        current = line
+                    else:
+                        current += line
+                if current:
+                    chunks.append(current)
+
+                for i, ch in enumerate(chunks, 1):
+                    header = f"👀 Preview {i}/{len(chunks)}"
+                    await context.bot.send_message(chat_id=cb_from_user_id, text=f"{header}\n{ch}")
+
+            # keep the original message with buttons
+            return
+
+        # Approvals / Denials (mass & personal)
         if data.startswith("approve|") or data.startswith("deny|"):
             action_type, token = data.split("|", maxsplit=1)
             req = pending_requests.get(token)
@@ -411,6 +515,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ This request has expired or was already handled.")
                 return
 
+            is_mass = req.get("mass", False)
+
+            if is_mass:
+                # Mass PH clock
+                if action_type == "approve":
+                    app_date = req.get("app_date", "")
+                    try:
+                        app_dt = datetime.strptime(app_date, "%Y-%m-%d").date()
+                        expiry_val = (app_dt + timedelta(days=365)).strftime("%Y-%m-%d")
+                    except Exception:
+                        expiry_val = "N/A"
+
+                    targets = req.get("targets", [])
+                    days = float(req["days"])
+                    reason = req["reason"]
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    appended = 0
+
+                    all_data = worksheet.get_all_values()
+                    last_by_user = {}
+                    for r in all_data:
+                        if len(r) > COL_TELEGRAM_ID and r[COL_TELEGRAM_ID].strip():
+                            last_by_user[r[COL_TELEGRAM_ID]] = r
+
+                    for uid, name in targets:
+                        last_row = last_by_user.get(uid)
+                        current_off = _safe_float(last_row[COL_FINAL_OFF]) if last_row else 0.0
+                        last_ph_total = _safe_float(last_row[COL_PH_OFF_TOTAL], 0.0) if (last_row and len(last_row) > COL_PH_OFF_TOTAL) else 0.0
+                        new_ph_total = last_ph_total + days
+
+                        worksheet.append_row([
+                            timestamp,
+                            uid,
+                            name or "-",
+                            "Clock Off (PH)",
+                            f"{current_off:.1f}",
+                            "+0",
+                            f"{current_off:.1f}",
+                            query.from_user.full_name,
+                            app_date or "-",
+                            reason,
+                            "Yes",
+                            expiry_val,
+                            f"{new_ph_total:.1f}"
+                        ])
+                        appended += 1
+
+                    await query.edit_message_text(f"✅ Mass PH Off clocked for {appended} users.")
+                    await context.bot.send_message(
+                        chat_id=req["group_id"],
+                        text=(
+                            f"✅ *Mass Clock PH Off* approved by {query.from_user.full_name}.\n"
+                            f"👥 Users updated: {appended}\n"
+                            f"📅 Days: {days}\n"
+                            f"📅 Application Date: {app_date or '-'}\n"
+                            f"📝 Reason: {reason}"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await query.edit_message_text("❌ Mass request denied.")
+                    await context.bot.send_message(
+                        chat_id=req["group_id"],
+                        text=f"❌ Mass PH Off clock was denied by {query.from_user.full_name}."
+                    )
+
+                # Clean up admin PMs for this token
+                if token in admin_message_refs:
+                    for admin_id, msg_id in admin_message_refs[token]:
+                        if admin_id != query.from_user.id:
+                            try:
+                                await context.bot.edit_message_text(
+                                    chat_id=admin_id,
+                                    message_id=msg_id,
+                                    text=f"⚠️ Request already handled by {query.from_user.full_name}.",
+                                )
+                            except Exception:
+                                pass
+                    del admin_message_refs[token]
+
+                pending_requests.pop(token, None)
+                return
+
+            # --- Personal flows (existing) ---
             req_user_id = str(req["user_id"])
             user_full_name = req.get("user_full_name") or req_user_id
             action = req["action"]  # 'clockoff' | 'claimoff' | 'clockph' | 'claimph'
@@ -419,24 +607,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_id = int(req["group_id"])
             app_date = req.get("app_date", "")
 
-            # Fetch last balances
             all_data = worksheet.get_all_values()
             rows = [row for row in all_data if len(row) >= 7 and row[COL_TELEGRAM_ID] == req_user_id]
             current_off = _safe_float(rows[-1][COL_FINAL_OFF]) if rows else 0.0
             last_ph_total = _safe_float(rows[-1][COL_PH_OFF_TOTAL], 0.0) if (rows and len(rows[-1]) > COL_PH_OFF_TOTAL) else 0.0
 
-            # Compute results depending on action
             is_ph = action in ("clockph", "claimph")
 
             if action_type == "approve":
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 if is_ph:
-                    # PH does not change Final Off
                     final_off = current_off
                     add_subtract = "+0"
                     holiday_flag = "Yes"
-                    # PH total update & expiry
                     new_ph_total = last_ph_total + days if action == "clockph" else last_ph_total - days
                     expiry = "N/A"
                     if action == "clockph":
@@ -446,17 +630,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             expiry = "N/A"
                 else:
-                    # Normal off logic
                     final_off = current_off + days if action == "clockoff" else current_off - days
                     add_subtract = f"+{days}" if action == "clockoff" else f"-{days}"
                     holiday_flag = "No"
                     expiry = "N/A"
-                    new_ph_total = last_ph_total  # carry over
+                    new_ph_total = last_ph_total
 
-                # Append to sheet in new order:
-                # Timestamp, Telegram ID, Name, Action, Current Off,
-                # Add/Subtract, Final Off, Approved By, Application Date,
-                # Remarks, Holiday Off, Expiry, PH Off Total
                 worksheet.append_row([
                     timestamp,
                     req_user_id,
@@ -473,7 +652,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{new_ph_total:.1f}"
                 ])
 
-                # Resolve display name for group announcement
                 display_name = user_full_name or req_user_id
                 try:
                     member = await context.bot.get_chat_member(group_id, int(req_user_id))
@@ -501,9 +679,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     details.append(f"📊 Final Off: {final_off:.1f} day(s)")
 
                 await context.bot.send_message(chat_id=group_id, text="\n".join(details))
-
             else:
-                # Deny
                 display_name = user_full_name or req_user_id
                 try:
                     member = await context.bot.get_chat_member(group_id, int(req_user_id))
@@ -521,7 +697,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"❌ {display_name}'s {(action.replace('ph',' PH').replace('off',' Off'))} was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
                 )
 
-            # Clean up admin messages for this token
             if token in admin_message_refs:
                 for admin_id, msg_id in admin_message_refs[token]:
                     if admin_id != query.from_user.id:
@@ -561,6 +736,7 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("claimoff", claimoff))
     telegram_app.add_handler(CommandHandler("clockphoff", clockphoff))
     telegram_app.add_handler(CommandHandler("claimphoff", claimphoff))
+    telegram_app.add_handler(CommandHandler("massclockphoff", massclockphoff))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
