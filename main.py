@@ -217,21 +217,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query.from_user.full_name, reason, timestamp
             ])
 
+            # --- NEW: Resolve user's display name for group announcement ---
+            display_name = str(user_id)
+            try:
+                member = await context.bot.get_chat_member(int(group_id), int(user_id))
+                if member and member.user:
+                    # Prefer full name; fallback to @username; finally user_id
+                    if member.user.full_name:
+                        display_name = member.user.full_name
+                    elif member.user.username:
+                        display_name = f"@{member.user.username}"
+            except Exception as e:
+                logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
+
             await query.edit_message_text("✅ Request approved and recorded.")
             await context.bot.send_message(
                 chat_id=int(group_id),
-                text=f"✅ {user_id}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n📅 Days: {days}\n📝 Reason: {reason}\n📊 Final: {final:.1f} day(s)"
+                text=(
+                    f"✅ {display_name}'s {action.replace('off', ' Off')} approved by {query.from_user.full_name}.\n"
+                    f"📅 Days: {days}\n"
+                    f"📝 Reason: {reason}\n"
+                    f"📊 Final: {final:.1f} day(s)"
+                )
             )
 
         elif data.startswith("deny|"):
             _, user_id, reason, group_id = data.split("|")
+
+            # --- NEW: Resolve user's display name for group announcement ---
+            display_name = str(user_id)
+            try:
+                member = await context.bot.get_chat_member(int(group_id), int(user_id))
+                if member and member.user:
+                    if member.user.full_name:
+                        display_name = member.user.full_name
+                    elif member.user.username:
+                        display_name = f"@{member.user.username}"
+            except Exception as e:
+                logger.warning(f"⚠️ Could not resolve name for {user_id} in group {group_id}: {e}")
+
             await query.edit_message_text("❌ Request denied.")
             await context.bot.send_message(
                 chat_id=int(group_id),
-                text=f"❌ {user_id}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
+                text=f"❌ {display_name}'s request was denied by {query.from_user.full_name}.\n📝 Reason: {reason}"
             )
 
-        # Clean up all admin messages
+        # Clean up all admin messages (kept as-is per working structure)
         if user_id in admin_message_refs:
             for admin_id, msg_id in admin_message_refs[user_id]:
                 if admin_id != query.from_user.id:
