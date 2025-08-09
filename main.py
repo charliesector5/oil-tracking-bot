@@ -826,16 +826,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if payload.get("type") in ("single",):
+            # Apply and let handle_single_apply() update all admin PMs consistently.
             await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
-            final_off = None
-            if kind == "approve":
-                cur = last_off_for_user(payload["user_id"])
-                calc = cur + (payload["days"] if "clock" in payload["action"] else -payload["days"])
-                final_off = calc
-            try:
-                await q.edit_message_text(build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=final_off))
-            except Exception:
-                pass
+            # No second edit here — avoids double-calculation and conflicting summaries.
             return
 
 # -----------------------------------------------------------------------------
