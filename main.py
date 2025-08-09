@@ -1,15 +1,16 @@
-# main.py
 import os
-import re
 import logging
 import asyncio
+import uuid
+import calendar as calmod
+from datetime import datetime, date, timedelta
+
 import nest_asyncio
 import gspread
-import uuid
-from datetime import datetime, timedelta, date
 from flask import Flask, request
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -24,185 +25,296 @@ from telegram.ext import (
     filters,
 )
 
-# --- Logging ---
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# --- Env ---
+# ---------------- Env ----------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "/etc/secrets/credentials.json")
 
-# --- Flask ---
+# ---------------- Flask ----------------
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def index():
     return "✅ Oil Tracking Bot is up."
 
-@app.route('/health')
+@app.route("/health")
 def health():
     return "✅ Health check passed."
 
-# --- Globals ---
+# ---------------- Globals ----------------
 telegram_app = None
 worksheet = None
 loop = asyncio.new_event_loop()
 
-# Per-user conversation states
-user_state = {}  # user_id -> dict
-# Short tokens -> pending approval payloads (keeps callback_data tiny)
-pending_tokens = {}  # token -> dict
-# Admin PM message references for cleanup after one admin handles
-admin_message_refs = {}  # token -> list[(admin_id, msg_id)]
+# Per-user conversational state
+# user_state[user_id] = {
+#   'token': 'abc123',
+#   'flow': 'normal'|'ph'|'mass_normal'|'mass_ph'|'newuser',
+#   'action': 'clockoff'|'claimoff'|'clockphoff'|'claimphoff'|'massclockoff'|'massclockphoff',
+#   'stage': 'awaiting_days'|'awaiting_app_date'|'awaiting_reason'|...
+#   'group_id': int,
+#   'days': float, 'app_date': 'YYYY-MM-DD', 'reason': str,
+#   # NEWUSER
+#   'nu_normal_days': float,
+#   'nu_ph_count': int, 'nu_idx': int, 'nu_entries': [{'date':'YYYY-MM-DD','reason':'...'}],
+# }
+user_state = {}
+
+# Short tokens used in callback_data
+# map token -> {'user_id': int, 'kind': 'flow'|'calendar', 'extra': {...}}
+tokens = {}
+
+# Pending approval requests (short token -> payload)
+pending_requests = {}
 
 MAX_REMARKS_LEN = 80
 
-# ---------- Helpers ----------
-def short_token() -> str:
-    return uuid.uuid4().hex[:10]
+# ---------------- Helpers ----------------
+def new_token(kind:str, user_id:int, extra:dict=None) -> str:
+    t = uuid.uuid4().hex[:10]
+    tokens[t] = {'user_id': user_id, 'kind': kind, 'extra': extra or {}}
+    return t
 
-def fmt_days(x: float) -> str:
-    return f"{x:.1f}".rstrip('0').rstrip('.') if x % 1 else f"{int(x)}"
+def cancel_markup(flow_token:str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"x|{flow_token}")]])
 
-def is_valid_half_step(value: float) -> bool:
-    # 0.5 steps: value*10 mod 5 == 0
-    return (value * 10) % 5 == 0
-
-def parse_date_yyyy_mm_dd(s: str) -> date | None:
+def safe_float(x:str):
     try:
-        y, m, d = map(int, s.split("-"))
-        return date(y, m, d)
+        return float(x)
+    except:
+        return None
+
+def is_half_step(x:float) -> bool:
+    return abs((x * 2) - round(x * 2)) < 1e-9  # multiples of 0.5
+
+def today_str() -> str:
+    return date.today().strftime("%Y-%m-%d")
+
+def ymd(dt:date) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+def parse_date(s:str):
+    try:
+        y, m, d = s.split("-")
+        return date(int(y), int(m), int(d))
     except Exception:
         return None
 
-def display_name_for_member(member) -> str:
-    if not member or not getattr(member, "user", None):
-        return ""
-    u = member.user
-    if u.full_name:
-        return u.full_name
-    if u.username:
-        return f"@{u.username}"
-    return str(u.id)
+def month_label(d:date) -> str:
+    return d.strftime("%B %Y")
 
-def safe_user_display(context: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int, fallback_name: str):
-    # Try resolving display name in group; fallback to provided
-    return fallback_name
+def ph_expiry(app_date_str:str) -> str:
+    d = parse_date(app_date_str)
+    if not d:
+        d = date.today()
+    return ymd(d + timedelta(days=365))
 
-def build_cancel_markup(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{token}")]])
+def latest_balance_rows(all_rows, user_id_str):
+    # Returns last normal balance and last PH total (for display/append convenience)
+    user_rows = [r for r in all_rows if len(r) >= 2 and r[1] == user_id_str]
+    if not user_rows:
+        return 0.0, 0.0
+    last = user_rows[-1]
+    current_off = safe_float(last[6]) or 0.0  # Final Off (col G, idx 6)
+    # PH Off Total (col L, idx 11) could be 'N/A' — treat as 0.0
+    ph_total = 0.0
+    try:
+        ph_total = float(last[11])
+    except:
+        ph_total = 0.0
+    return current_off, ph_total
 
-def build_calendar_markup(token: str, ref: date) -> InlineKeyboardMarkup:
-    # Simple full-month grid; each cell callback is cal|<token>|YYYY-MM-DD
-    # Week rows Sun..Sat
-    first = ref.replace(day=1)
-    start_wd = first.weekday()  # Mon=0..Sun=6
-    # We want Sun first; shift to Sun=0..Sat=6
-    sun_first_shift = (start_wd + 1) % 7
-    # Days in month
-    if first.month == 12:
-        next_month = first.replace(year=first.year + 1, month=1, day=1)
+def compute_next_balances(action:str, current_off:float, days:float):
+    if action in ("clockoff", "massclockoff"):
+        return current_off + days, f"+{days}"
+    elif action in ("claimoff",):
+        return current_off - days, f"-{days}"
+    # PH does not change normal current_off; keep as-is for G but we still write +/- into F for clarity
+    elif action in ("clockphoff", "massclockphoff"):
+        return current_off, f"+{days}"
+    elif action in ("claimphoff",):
+        return current_off, f"-{days}"
     else:
-        next_month = first.replace(month=first.month + 1, day=1)
-    days_in_month = (next_month - first).days
+        return current_off, "0"
 
-    rows = []
-    # header
-    rows.append([InlineKeyboardButton(first.strftime("📅 %B %Y"), callback_data=f"noop|{token}")])
-    # weekday header
-    rows.append([InlineKeyboardButton(x, callback_data=f"noop|{token}") for x in ["Su","Mo","Tu","We","Th","Fr","Sa"]])
+def must_be_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("OK", callback_data="noop|ok")]])
 
-    day = 1
-    # leading blanks
-    week = []
-    for i in range(sun_first_shift):
-        week.append(InlineKeyboardButton(" ", callback_data=f"noop|{token}"))
+# ---------------- Calendar ----------------
+async def show_calendar(chat_id:int, user_id:int, purpose:str, context:ContextTypes.DEFAULT_TYPE,
+                        base_month:date=None, message_id=None):
+    """
+    purpose: identifies what we are picking the date for.
+      One calendar per request, bound to a short token -> user_id + purpose
+    """
+    base = base_month or date.today().replace(day=1)
+    token = new_token("calendar", user_id, extra={"purpose": purpose, "month": ymd(base)})
+    kb = []
 
-    while day <= days_in_month:
-        while len(week) < 7 and day <= days_in_month:
-            d = date(first.year, first.month, day)
-            week.append(InlineKeyboardButton(str(day), callback_data=f"cal|{token}|{d.isoformat()}"))
-            day += 1
-        if len(week) < 7:
-            while len(week) < 7:
-                week.append(InlineKeyboardButton(" ", callback_data=f"noop|{token}"))
-        rows.append(week)
-        week = []
+    # Title row
+    kb.append([InlineKeyboardButton(f"📅 {month_label(base)}", callback_data=f"noop|{token}")])
 
-    # nav
-    prev_month = (first - timedelta(days=1)).replace(day=1)
-    next_m = next_month
-    rows.append([
-        InlineKeyboardButton("« Prev", callback_data=f"calnav|{token}|{prev_month.isoformat()}"),
+    # Weekday header
+    kb.append([InlineKeyboardButton(x, callback_data=f"noop|{token}") for x in ["Su","Mo","Tu","We","Th","Fr","Sa"]])
+
+    # Calendar grid
+    mcal = calmod.Calendar(firstweekday=6)  # Sunday
+    days = list(mcal.itermonthdates(base.year, base.month))
+    # 6 rows of 7 cells
+    row = []
+    for idx, d in enumerate(days):
+        if d.month != base.month:
+            txt = " "
+            cb = f"noop|{token}"
+        else:
+            txt = str(d.day)
+            cb = f"cal|{token}|{ymd(d)}"
+        row.append(InlineKeyboardButton(txt, callback_data=cb))
+        if (idx + 1) % 7 == 0:
+            kb.append(row)
+            row = []
+    if row:
+        while len(row) < 7:
+            row.append(InlineKeyboardButton(" ", callback_data=f"noop|{token}"))
+        kb.append(row)
+
+    # Nav / Manual / Cancel
+    prev_month = (base.replace(day=1) - timedelta(days=1)).replace(day=1)
+    next_month = (base.replace(day=28) + timedelta(days=4)).replace(day=1)
+    kb.append([
+        InlineKeyboardButton("« Prev", callback_data=f"calnav|{token}|{ymd(prev_month)}"),
         InlineKeyboardButton("Manual entry", callback_data=f"manual|{token}"),
-        InlineKeyboardButton("Next »", callback_data=f"calnav|{token}|{next_m.isoformat()}"),
+        InlineKeyboardButton("Next »", callback_data=f"calnav|{token}|{ymd(next_month)}"),
     ])
-    # cancel
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{token}")])
-    return InlineKeyboardMarkup(rows)
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data=f"x|{user_state.get(user_id,{}).get('token','0')}")])
 
-async def dm_admins(context: ContextTypes.DEFAULT_TYPE, group_id: int, text: str, reply_markup: InlineKeyboardMarkup | None):
-    admins = await context.bot.get_chat_administrators(group_id)
-    sent = []
-    for admin in admins:
-        if admin.user.is_bot:
-            continue
-        try:
-            msg = await context.bot.send_message(chat_id=admin.user.id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
-            sent.append((admin.user.id, msg.message_id))
-        except Exception as e:
-            logger.warning(f"⚠️ Cannot PM admin {admin.user.id}: {e}")
-    return sent
+    text = "📅 **Select Application Date:**\n• Tap a date below, or\n• Tap **Manual entry**, then type `YYYY-MM-DD`."
+    if message_id:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
-def sheet_get_user_rows(uid: int | str):
-    all_data = worksheet.get_all_values()
-    return [row for row in all_data if len(row) > 1 and row[1] == str(uid)], all_data
+async def handle_calendar_click(update:Update, context:ContextTypes.DEFAULT_TYPE, data:str):
+    # data formats:
+    #  cal|<ctoken>|YYYY-MM-DD
+    #  calnav|<ctoken>|YYYY-MM-01
+    #  manual|<ctoken>
+    parts = data.split("|")
+    kind = parts[0]
+    ctoken = parts[1]
+    info = tokens.get(ctoken)
+    if not info or info["kind"] != "calendar":
+        await update.callback_query.answer("Expired calendar.")
+        return
 
-def get_current_off(uid: int | str) -> float:
-    rows, _ = sheet_get_user_rows(uid)
-    if rows:
-        try:
-            return float(rows[-1][6])  # Final Off
-        except Exception:
-            return 0.0
-    return 0.0
+    uid = info["user_id"]
+    if uid not in user_state:
+        await update.callback_query.answer("Session ended.")
+        return
 
-def append_sheet_row(
-    timestamp: str,
-    uid: str,
-    name: str,
-    action_text: str,
-    current_off: float,
-    add_subtract: str,
-    final_off: float,
-    approved_by: str,
-    app_date: str,
-    remarks: str,
-    holiday_off: str,
-    ph_total: str,
-    expiry: str
-):
-    worksheet.append_row([
-        timestamp, uid, name, action_text,
-        f"{current_off:.1f}", add_subtract, f"{final_off:.1f}",
-        approved_by, app_date, remarks, holiday_off, ph_total, expiry
-    ])
+    st = user_state[uid]
+    chat_id = update.effective_chat.id
 
-def human_action(action: str) -> str:
-    if action == "clockoff": return "Clock Off"
-    if action == "claimoff": return "Claim Off"
-    if action == "clockphoff": return "Clock PH Off"
-    if action == "claimphoff": return "Claim PH Off"
-    return action
+    if kind == "calnav":
+        base = parse_date(parts[2]) or date.today().replace(day=1)
+        await show_calendar(chat_id, uid, info["extra"]["purpose"], context, base_month=base,
+                            message_id=update.callback_query.message.message_id)
+        await update.callback_query.answer()
+        return
 
-# ---------- Commands ----------
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if kind == "manual":
+        st["stage"] = "awaiting_manual_date"
+        await context.bot.send_message(chat_id=chat_id,
+            text="⌨️ Please type the date in `YYYY-MM-DD`.", parse_mode="Markdown",
+            reply_markup=cancel_markup(st["token"]))
+        await update.callback_query.answer("Type a date.")
+        return
+
+    if kind == "cal":
+        # Got a date; store and move on
+        app_date = parts[2]
+        st["app_date"] = app_date
+        # Update the calendar message to freeze selection
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=update.callback_query.message.message_id,
+            text=f"📅 Application Date selected: *{app_date}*",
+            parse_mode="Markdown"
+        )
+        await update.callback_query.answer()
+
+        # Where to go next depends on flow
+        if st["flow"] in ("normal", "ph", "mass_normal", "mass_ph"):
+            st["stage"] = "awaiting_reason"
+            await context.bot.send_message(chat_id=chat_id,
+                text=f"📝 Enter reason (max {MAX_REMARKS_LEN} chars):",
+                reply_markup=cancel_markup(st["token"]))
+            return
+
+        if st["flow"] == "newuser":
+            # There are two sub-cases in onboarding:
+            # - picking date for normal import (if we ever add that)
+            # - picking date for PH entry i (this is what we do)
+            if st.get("nu_mode") == "ph_date":
+                # we just selected the PH date after having a reason in st['nu_temp_reason']
+                st["nu_entries"].append({"date": app_date, "reason": st.get("nu_temp_reason","Transfer")})
+                st["nu_temp_reason"] = ""
+                st["nu_idx"] += 1
+                if st["nu_idx"] < st["nu_ph_count"]:
+                    # next PH entry
+                    st["nu_mode"] = "ph_reason"
+                    await context.bot.send_message(chat_id=chat_id,
+                        text=f"PH Entry {st['nu_idx']+1}/{st['nu_ph_count']} — Enter reason (max {MAX_REMARKS_LEN} chars):",
+                        reply_markup=cancel_markup(st["token"]))
+                else:
+                    # Done; preview to admins
+                    await send_newuser_preview(update, context, st)
+            else:
+                # Not expected right now
+                st["stage"] = "awaiting_reason"
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"📝 Enter reason (max {MAX_REMARKS_LEN} chars):",
+                    reply_markup=cancel_markup(st["token"]))
+            return
+
+# ---------------- Webhook ----------------
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    global telegram_app
+    if telegram_app is None:
+        log.warning("⚠️ Telegram app not initialized.")
+        return "Bot not ready", 503
+    try:
+        upd = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        log.info("📨 Incoming update: %s", request.get_json(force=True))
+        fut = asyncio.run_coroutine_threadsafe(telegram_app.process_update(upd), loop)
+        return "OK"
+    except Exception:
+        log.exception("❌ Error processing update")
+        return "Internal Server Error", 500
+
+# ---------------- Command Handlers ----------------
+async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛠️ *Oil Tracking Bot Help*\n\n"
         "/clockoff – Request to clock normal OIL\n"
@@ -211,831 +323,824 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/claimphoff – Claim Public Holiday OIL (PH)\n"
         "/massclockoff – Admin: Mass clock normal OIL for all\n"
         "/massclockphoff – Admin: Mass clock PH OIL for all (with preview)\n"
+        "/newuser – Onboard: import old records\n"
+        "/startadmin – PM the bot to start admin inbox\n"
         "/summary – Your current balance & PH details\n"
-        "/allsummary – Everyone’s balances at a glance (admin)\n"
-        "/newuser – Import your past OIL and PH entries (onboarding)\n"
-        "/startadmin – Start admin PM session\n"
         "/history – Your past 5 logs\n"
         "/help – Show this help message\n\n"
-        "Tip: tap *Cancel* to abort any step.",
+        "Tip: You can always tap ❌ *Cancel* to abort.",
         parse_mode="Markdown"
     )
 
-# start admin in PM only
-async def startadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def startadmin_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    # Should be PM; if not, ask user to PM
     if update.effective_chat.type != "private":
-        await update.message.reply_text("ℹ️ Please PM me and run /startadmin there.")
+        await update.message.reply_text("ℹ️ Please PM me and send /startadmin there.")
         return
-    await update.message.reply_text("✅ Admin session started. I’ll DM you requests to approve or deny.")
+    await update.message.reply_text("✅ Admin inbox ready. I’ll DM you approvals from group requests here.")
 
-# normal clock/claim
-async def clockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "normal", "action": "clockoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "🕓 How many days do you want to *clock off*? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=build_cancel_markup(token)
-    )
+# Normal / PH entry points
+async def clockoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, flow="normal", action="clockoff")
 
-async def claimoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "normal", "action": "claimoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "📥 How many days do you want to *claim off*? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=build_cancel_markup(user_state[update.effective_user.id]["token"])
-    )
+async def claimoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, flow="normal", action="claimoff")
 
-# PH clock/claim
-async def clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "ph", "action": "clockphoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "🏖️ How many *PH OIL* days to *clock*? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=build_cancel_markup(token)
-    )
+async def clockphoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, flow="ph", action="clockphoff")
 
-async def claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "ph", "action": "claimphoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "🏖️📥 How many *PH OIL* days to *claim*? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=build_cancel_markup(token)
-    )
+async def claimphoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, flow="ph", action="claimphoff")
 
-# history/summary
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    try:
-        all_data = worksheet.get_all_values()
-        rows = [r for r in all_data if len(r) > 1 and r[1] == str(user.id)]
-        if rows:
-            last_5 = rows[-5:]
-            response = "\n".join([f"{row[0]} | {row[3]} | {row[5]} → {row[6]} | {row[8]}" for row in last_5])
-            await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{response}")
-        else:
-            await update.message.reply_text("📜 No logs found.")
-    except Exception:
-        logger.exception("❌ Failed to fetch history")
-        await update.message.reply_text("❌ Could not retrieve your logs.")
+# Mass
+async def massclockoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_mass_preview(update, context, flow="mass_normal", action="massclockoff")
 
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    try:
-        all_rows = worksheet.get_all_values()
-        my = [r for r in all_rows if len(r) > 1 and r[1] == str(uid)]
-        if not my:
-            await update.message.reply_text("📊 No records yet.")
-            return
-        bal = float(my[-1][6]) if my[-1][6] else 0.0
-
-        # PH outstanding list (sum PH Off Total per application date, only positive)
-        ph_rows = [r for r in my if len(r) >= 12 and (len(r) > 10 and (r[10] or "").strip().lower() == "yes")]
-        from collections import defaultdict
-        per_date = defaultdict(float)
-        per_reason = defaultdict(str)
-        expiry_map = {}
-        for r in ph_rows:
-            app_date = r[8]
-            amt = 0.0
-            try:
-                amt = float(r[11]) if r[11] else 0.0
-            except Exception:
-                amt = 0.0
-            per_date[app_date] += amt
-            per_reason[app_date] = r[9] or per_reason.get(app_date, "")
-            expiry_map[app_date] = r[12] if len(r) > 12 and r[12] else "N/A"
-
-        active_lines = []
-        for adt, amt in sorted(per_date.items()):
-            if amt > 0.0001:
-                exp = expiry_map.get(adt, "N/A")
-                reason = per_reason.get(adt, "")
-                active_lines.append(f"• {adt}: {fmt_days(amt)} (exp {exp}) – {reason}")
-
-        total_ph = sum(v for v in per_date.values() if v > 0)
-        if not active_lines:
-            ph_block = "🔎 PH Off Entries: None"
-        else:
-            ph_block = "🔎 PH Off Entries:\n" + "\n".join(active_lines)
-
-        await update.message.reply_text(
-            f"📊 Current Off Balance: {fmt_days(bal)} day(s).\n"
-            f"🏖 PH Off Total: {fmt_days(total_ph)} day(s)\n"
-            f"{ph_block}"
-        )
-    except Exception:
-        logger.exception("❌ Failed to compute summary")
-        await update.message.reply_text("❌ Could not compute summary.")
-
-# admin-only mass clock (normal + PH) — preview + confirm
-async def massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only admins
-    try:
-        admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-        admin_ids = {a.user.id for a in admins if not a.user.is_bot}
-        if update.effective_user.id not in admin_ids:
-            await update.message.reply_text("🚫 Admins only.")
-            return
-    except Exception:
-        await update.message.reply_text("🚫 Admins only.")
-        return
-
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "mass_normal", "action": "clockoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "👥 Mass Clock (Normal)\nHow many days per user? (0.5 to 3, in 0.5 steps)",
-        reply_markup=build_cancel_markup(token)
-    )
-
-async def massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only admins
-    try:
-        admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-        admin_ids = {a.user.id for a in admins if not a.user.is_bot}
-        if update.effective_user.id not in admin_ids:
-            await update.message.reply_text("🚫 Admins only.")
-            return
-    except Exception:
-        await update.message.reply_text("🚫 Admins only.")
-        return
-
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "mass_ph", "action": "clockphoff", "stage": "awaiting_days",
-        "token": token, "group_id": update.effective_chat.id
-    }
-    await update.message.reply_text(
-        "👥 Mass Clock (PH)\nHow many PH days per user? (0.5 to 3, in 0.5 steps)",
-        reply_markup=build_cancel_markup(token)
-    )
+async def massclockphoff_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await start_mass_preview(update, context, flow="mass_ph", action="massclockphoff")
 
 # Onboarding
-async def newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = short_token()
-    user_state[update.effective_user.id] = {
-        "flow": "newuser", "stage": "awaiting_import_days",
-        "token": token, "group_id": update.effective_chat.id,
-        "import_days": 0.0, "ph_entries": []
+async def newuser_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    # Must be in group to start (so we know which sheet/community)
+    if chat.type == "private":
+        await update.message.reply_text("ℹ️ Please use /newuser *in the group* to start onboarding.", parse_mode="Markdown")
+        return
+
+    # Already has rows?
+    try:
+        all_rows = worksheet.get_all_values()
+        existing = any((len(r)>=2 and r[1]==str(user.id)) for r in all_rows)
+        if existing:
+            await update.message.reply_text("✅ You’re already registered; no need to import again.")
+            return
+    except Exception:
+        log.exception("Failed reading sheet for newuser check")
+
+    # Init state
+    tok = new_token("flow", user.id)
+    user_state[user.id] = {
+        "token": tok,
+        "flow": "newuser",
+        "action": "newuser",
+        "stage": "awaiting_nu_normal_days",
+        "group_id": chat.id,
+        "nu_normal_days": 0.0,
+        "nu_ph_count": 0,
+        "nu_idx": 0,
+        "nu_entries": [],
+        "nu_mode": "",  # ph_reason -> ph_date loop
     }
     await update.message.reply_text(
         "🆕 *Onboarding: Import Old Records*\n\n"
-        "1) How many *normal OIL* days to import?\n"
-        "   (Enter a number, e.g. 7.5 or 0 if none)",
+        "1) How many *normal OIL days* to import? (Enter any positive number, e.g. 7.5, or 0 if none)",
         parse_mode="Markdown",
-        reply_markup=build_cancel_markup(token)
+        reply_markup=cancel_markup(tok)
     )
 
-# ---------- Message handler (stages) ----------
-@logger.catch if hasattr(logger, "catch") else (lambda f: f)
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = (update.message.text or "").strip()
-    st = user_state.get(uid)
-    if not st:
-        return
+# Summary / History
+async def summary_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        all_rows = worksheet.get_all_values()
+        rows = [r for r in all_rows if len(r)>=2 and r[1]==str(user.id)]
+        if not rows:
+            await update.message.reply_text("📊 No records found.")
+            return
 
-    logger.info(f"handle_message: uid={uid} stage={st.get('stage')} flow={st.get('flow')} action={st.get('action')} text={text}")
+        last = rows[-1]
+        balance = last[6]  # Final Off
+        # PH active entries: Holiday Off == "Yes" and expiry >= today
+        today = today_str()
+        ph_list = []
+        for r in rows:
+            if len(r) >= 13 and str(r[10]).strip().lower() == "yes":  # Holiday Off
+                exp = r[12] if len(r) >= 13 else "N/A"
+                app = r[8]
+                reason = r[9]
+                try:
+                    if exp >= today:
+                        ph_list.append(f"• {app}: +{r[5].lstrip('+')} (exp {exp}) - {reason}")
+                except:
+                    pass
 
-    # universal quit words (still keep inline Cancel as primary)
-    if text.lower() in {"-quit", "cancel"}:
-        user_state.pop(uid, None)
-        await update.message.reply_text("🧹 Cancelled.")
-        return
-
-    def ask_date():
-        # calendar + manual option
-        token = st["token"]
-        ref = date.today()
-        return update.message.reply_text(
-            ("📅 *Select Application Date*:\n"
-             "• Tap a date below, or\n"
-             "• Tap *Manual entry*, then type YYYY-MM-DD."),
-            parse_mode="Markdown",
-            reply_markup=build_calendar_markup(token, ref)
-        )
-
-    # ---- Normal / PH / Mass flows: get days ----
-    if st["stage"] == "awaiting_days":
+        ph_total = 0.0
         try:
-            days = float(text)
-            if days <= 0:
-                raise ValueError()
-            if not is_valid_half_step(days) or days < 0.5 or days > 3:
-                raise ValueError()
-        except Exception:
-            await update.message.reply_text("❌ Invalid input. Enter a number between 0.5 and 3 in 0.5 steps.")
+            val = float(last[11])
+            ph_total = val
+        except:
+            # fallback: count active PH rows as +1/-1 if present
+            for r in rows:
+                if len(r) >= 13 and str(r[10]).strip().lower() == "yes":
+                    try:
+                        delta = float(r[5])
+                    except:
+                        try:
+                            delta = float(r[5].replace('+',''))
+                        except:
+                            delta = 0.0
+                    ph_total += delta
+
+        text = f"📊 Current Off Balance: {balance} day(s).\n🏖 PH Off Total: {ph_total:.1f} day(s)"
+        if ph_list:
+            text += "\n🔎 PH Off Entries:\n" + "\n".join(ph_list)
+        await update.message.reply_text(text)
+    except Exception:
+        log.exception("summary failed")
+        await update.message.reply_text("❌ Could not retrieve your summary.")
+
+async def history_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        all_rows = worksheet.get_all_values()
+        rows = [r for r in all_rows if len(r)>=2 and r[1]==str(user.id)]
+        if not rows:
+            await update.message.reply_text("📜 No logs found.")
             return
-        st["days"] = days
-        # next: date
-        st["stage"] = "awaiting_date"
-        await ask_date()
+        last5 = rows[-5:]
+        body = "\n".join([f"{r[0]} | {r[3]} | {r[5]} → {r[6]} | {r[8]}" for r in last5])
+        await update.message.reply_text(f"📜 Your last 5 OIL logs:\n\n{body}")
+    except Exception:
+        log.exception("history failed")
+        await update.message.reply_text("❌ Could not retrieve your logs.")
+
+# ---------------- Flow starters ----------------
+async def start_flow_days(update:Update, context:ContextTypes.DEFAULT_TYPE, flow:str, action:str):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    tok = new_token("flow", user.id)
+    user_state[user.id] = {
+        "token": tok,
+        "flow": flow,
+        "action": action,
+        "stage": "awaiting_days",
+        "group_id": chat.id
+    }
+
+    if flow == "normal" and action == "clockoff":
+        pfx = "🕒"
+        txt = "How many days do you want to *clock off*? (0.5 to 3, in 0.5 steps)"
+    elif flow == "normal" and action == "claimoff":
+        pfx = "🗂"
+        txt = "How many days do you want to *claim off*? (0.5 to 3, in 0.5 steps)"
+    elif flow == "ph" and action == "clockphoff":
+        pfx = "🏝"
+        txt = "How many *PH OIL* days to clock? (0.5 to 3, in 0.5 steps)"
+    elif flow == "ph" and action == "claimphoff":
+        pfx = "🏝"
+        txt = "How many *PH OIL* days to claim? (0.5 to 3, in 0.5 steps)"
+    else:
+        pfx = "⏳"
+        txt = "How many days?"
+
+    await update.message.reply_text(
+        f"{pfx} {txt}",
+        parse_mode="Markdown",
+        reply_markup=cancel_markup(tok)
+    )
+
+async def start_mass_preview(update:Update, context:ContextTypes.DEFAULT_TYPE, flow:str, action:str):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # Admin check
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        admin_ids = [a.user.id for a in admins if not a.user.is_bot]
+        if user.id not in admin_ids:
+            await update.message.reply_text("⛔️ Only admins can run mass actions.")
+            return
+    except Exception:
+        log.exception("admin check failed")
+        await update.message.reply_text("❌ Failed to check admin privileges.")
         return
 
-    # ---- Date typed manually (fallback when waiting for date) ----
-    if st["stage"] == "awaiting_date":
-        dt = parse_date_yyyy_mm_dd(text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
-        if not dt:
-            await update.message.reply_text("❌ Please enter date as YYYY-MM-DD, or pick from the calendar.")
-            return
-        st["app_date"] = dt.isoformat()
-        st["stage"] = "awaiting_reason"
+    # Preview list based on sheet distinct users (skip header / malformed)
+    try:
+        rows = worksheet.get_all_values()
+        seen = {}
+        for r in rows:
+            if len(r) >= 3 and r[1].isdigit():
+                seen[r[1]] = r[2] or r[1]
+        # Show names
+        listing = "\n".join([f"• {name} ({uid})" for uid, name in seen.items()])
+        if not listing:
+            listing = "• (none yet – once people interact, they’ll appear here)"
         await update.message.reply_text(
-            f"📝 Enter reason (max {MAX_REMARKS_LEN} chars):",
-            reply_markup=build_cancel_markup(st["token"])
+            f"👥 Mass-action preview (from sheet):\n{listing}"
         )
+    except Exception:
+        log.exception("mass preview failed")
+        await update.message.reply_text("❌ Could not build preview list.")
         return
 
-    # ---- Reason ----
-    if st["stage"] == "awaiting_reason":
-        reason = text
-        if len(reason) > MAX_REMARKS_LEN:
-            reason = reason[:MAX_REMARKS_LEN]
-            await update.message.reply_text(f"✂️ Remarks trimmed to {MAX_REMARKS_LEN} characters.")
-        st["reason"] = reason
+    tok = new_token("flow", user.id)
+    user_state[user.id] = {
+        "token": tok,
+        "flow": flow,
+        "action": action,
+        "stage": "awaiting_days",
+        "group_id": chat.id,
+    }
 
-        # If this is mass flow, we prepare a preview instead of direct admin DM
-        if st["flow"] in {"mass_normal", "mass_ph"}:
-            # Build preview list from SHEET (unique users with at least one row), ignoring header-ish rows
-            _, all_rows = sheet_get_user_rows(uid)  # just to fetch all rows
-            # include unique user ids where row[1] is numeric and not header
-            from collections import OrderedDict
-            uniq = OrderedDict()
-            for r in all_rows[1:]:
-                if len(r) < 3: 
-                    continue
-                rid = r[1]
-                nm = r[2]
-                if not rid.isdigit():
-                    continue
-                if rid not in uniq:
-                    uniq[rid] = nm or rid
-            names = [f"- {nm} ({rid})" for rid, nm in uniq.items()]
-            if not names:
-                await update.message.reply_text("⚠️ No known users to mass clock (sheet is empty).")
-                user_state.pop(uid, None)
-                return
+    if action == "massclockoff":
+        await update.message.reply_text(
+            "🧮 Days to *mass clock (normal)* for everyone? (0.5 to 3, in 0.5 steps)",
+            parse_mode="Markdown",
+            reply_markup=cancel_markup(tok)
+        )
+    else:
+        await update.message.reply_text(
+            "🧮 Days to *mass clock (PH)* for everyone? (0.5 to 3, in 0.5 steps)",
+            parse_mode="Markdown",
+            reply_markup=cancel_markup(tok)
+        )
 
-            st["mass_targets"] = list(uniq.items())
-            pretty = "\n".join(names[:100])  # avoid oversize message
-            await update.message.reply_text(
-                f"👥 *Mass Preview* ({len(names)} users)\n\n{pretty}\n\n"
-                "Proceed?",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm", callback_data=f"massgo|{st['token']}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['token']}")
-                ]])
-            )
+# ---------------- Message handler (text replies) ----------------
+async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in user_state:
+        return
+    st = user_state[user.id]
+    text = (update.message.text or "").strip()
+    log.info("handle_message: uid=%s stage=%s flow=%s action=%s text=%s",
+             user.id, st.get("stage"), st.get("flow"), st.get("action"), text)
+
+    # Global: manual date entry when stage asks for it
+    if st["stage"] == "awaiting_manual_date":
+        d = parse_date(text)
+        if not d:
+            await update.message.reply_text("❌ Invalid date. Please use YYYY-MM-DD.",
+                                            reply_markup=cancel_markup(st["token"]))
+            return
+        st["app_date"] = ymd(d)
+        # next hop
+        if st["flow"] in ("normal","ph","mass_normal","mass_ph"):
+            st["stage"] = "awaiting_reason"
+            await update.message.reply_text(f"📝 Enter reason (max {MAX_REMARKS_LEN} chars):",
+                                            reply_markup=cancel_markup(st["token"]))
+            return
+        if st["flow"] == "newuser" and st.get("nu_mode") == "ph_date":
+            st["nu_entries"].append({"date": ymd(d), "reason": st.get("nu_temp_reason","Transfer")})
+            st["nu_temp_reason"] = ""
+            st["nu_idx"] += 1
+            if st["nu_idx"] < st["nu_ph_count"]:
+                st["nu_mode"] = "ph_reason"
+                await update.message.reply_text(
+                    f"PH Entry {st['nu_idx']+1}/{st['nu_ph_count']} — Enter reason (max {MAX_REMARKS_LEN} chars):",
+                    reply_markup=cancel_markup(st["token"]))
+            else:
+                await send_newuser_preview(update, context, st)
             return
 
-        # Otherwise: single-user approval
-        await submit_for_approval(update, context, st)
-        user_state.pop(uid, None)
-        return
-
-    # ---- Newuser flow ----
+    # ---- Newuser path ----
     if st["flow"] == "newuser":
-        if st["stage"] == "awaiting_import_days":
-            try:
-                days = float(text)
-                if days < 0:
-                    raise ValueError()
-            except Exception:
-                await update.message.reply_text("❌ Please enter a number (e.g., 7.5) or 0.")
+        if st["stage"] == "awaiting_nu_normal_days":
+            val = safe_float(text)
+            if val is None or val < 0:
+                await update.message.reply_text("❌ Enter a non-negative number (e.g., 7.5 or 0).",
+                                                reply_markup=cancel_markup(st["token"]))
                 return
-            st["import_days"] = days
-            st["stage"] = "newuser_ph_count"
+            st["nu_normal_days"] = val
+            st["stage"] = "awaiting_nu_ph_count"
             await update.message.reply_text(
-                "PH import: how many *separate PH entries* do you have? (Enter 0 if none)\n"
-                "We’ll capture *Application Date* and *Reason* for each.",
+                "2) How many *PH entries* to import? (Enter an integer, e.g., 0, 1, 2 ...)",
                 parse_mode="Markdown",
-                reply_markup=build_cancel_markup(st["token"])
+                reply_markup=cancel_markup(st["token"])
             )
             return
-        if st["stage"] == "newuser_ph_count":
+
+        if st["stage"] == "awaiting_nu_ph_count":
             try:
                 cnt = int(text)
-                if cnt < 0 or cnt > 20:
-                    raise ValueError()
-            except Exception:
-                await update.message.reply_text("❌ Enter a whole number from 0 to 20.")
+                if cnt < 0 or cnt > 50:
+                    raise ValueError
+            except:
+                await update.message.reply_text("❌ Enter an integer between 0 and 50.",
+                                                reply_markup=cancel_markup(st["token"]))
                 return
-            st["ph_needed"] = cnt
-            st["ph_index"] = 0
-            st["ph_entries"] = []
+            st["nu_ph_count"] = cnt
+            st["nu_idx"] = 0
+            st["nu_entries"] = []
             if cnt == 0:
-                # Submit to admins directly
-                await submit_newuser_for_approval(update, context, st)
-                user_state.pop(uid, None)
+                # no PH entries, send preview straight away
+                await send_newuser_preview(update, context, st)
                 return
-            # For first PH: ask date via calendar
-            st["stage"] = "newuser_ph_date"
+            # Start PH entry loop: reason then date
+            st["nu_mode"] = "ph_reason"
             await update.message.reply_text(
-                f"PH Entry {st['ph_index']+1}/{st['ph_needed']} — *Select Application Date*",
-                parse_mode="Markdown",
-                reply_markup=build_calendar_markup(st["token"], date.today())
-            )
+                f"PH Entry 1/{cnt} — Enter reason (max {MAX_REMARKS_LEN} chars):",
+                reply_markup=cancel_markup(st["token"]))
             return
-        if st["stage"] == "newuser_ph_date":
-            # Manual typed?
-            dt = parse_date_yyyy_mm_dd(text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
-            if not dt:
-                await update.message.reply_text("❌ Type date as YYYY-MM-DD, or pick from the calendar.")
-                return
-            st["ph_current_date"] = dt.isoformat()
-            st["stage"] = "newuser_ph_reason"
-            await update.message.reply_text(
-                f"PH Entry {st['ph_index']+1}/{st['ph_needed']} — Enter *Reason* (max {MAX_REMARKS_LEN} chars):",
-                parse_mode="Markdown",
-                reply_markup=build_cancel_markup(st["token"])
-            )
-            return
-        if st["stage"] == "newuser_ph_reason":
+
+        if st.get("nu_mode") == "ph_reason":
             reason = text[:MAX_REMARKS_LEN]
-            st["ph_entries"].append({"app_date": st["ph_current_date"], "reason": reason})
-            st["ph_index"] += 1
-            if st["ph_index"] >= st["ph_needed"]:
-                # Submit to admins
-                await submit_newuser_for_approval(update, context, st)
-                user_state.pop(uid, None)
-                return
-            # next date
-            st["stage"] = "newuser_ph_date"
-            await update.message.reply_text(
-                f"PH Entry {st['ph_index']+1}/{st['ph_needed']} — *Select Application Date*",
-                parse_mode="Markdown",
-                reply_markup=build_calendar_markup(st["token"], date.today())
-            )
+            st["nu_temp_reason"] = reason
+            st["nu_mode"] = "ph_date"
+            st["stage"] = "awaiting_app_date"
+            await show_calendar(update.effective_chat.id, user.id, purpose="nu_ph_date", context=context)
             return
 
-# ---------- Approval submission ----------
-async def submit_for_approval(update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict):
-    user = update.effective_user
-    uid = user.id
-    group_id = st["group_id"]
-    days = float(st["days"])
-    app_date = st["app_date"]
-    reason = st["reason"]
-    action = st["action"]
-
-    # No negative or zero days (extra guard)
-    if days <= 0:
-        await update.message.reply_text("🚫 Days must be greater than 0.")
+    # ---- Normal / PH / Mass paths ----
+    if st["stage"] == "awaiting_days":
+        val = safe_float(text)
+        if val is None or val <= 0:
+            await update.message.reply_text("❌ Enter a *positive* number.",
+                                            parse_mode="Markdown",
+                                            reply_markup=cancel_markup(st["token"]))
+            return
+        # Only normal UI is restricted to 0.5, 3, 0.5 steps
+        if st["flow"] in ("normal","ph","mass_normal","mass_ph"):
+            if val < 0.5 or val > 3 or not is_half_step(val):
+                await update.message.reply_text("❌ Use 0.5 to 3 (in 0.5 steps).",
+                                                reply_markup=cancel_markup(st["token"]))
+                return
+        st["days"] = val
+        st["stage"] = "awaiting_app_date"
+        await show_calendar(update.effective_chat.id, user.id, purpose="app_date", context=context)
         return
 
-    # Compute balances for preview
-    current_off = get_current_off(uid) if action in {"clockoff", "claimoff"} else get_current_off(uid)
-    if action == "clockoff":
-        new_off = current_off + days
-    elif action == "claimoff":
-        new_off = current_off - days
-    else:
-        # PH flows don't change normal balance by themselves
-        new_off = current_off
+    if st["stage"] == "awaiting_reason":
+        reason = text[:MAX_REMARKS_LEN]
+        st["reason"] = reason
 
-    token = short_token()
-    pending_tokens[token] = {
-        "kind": "single",
-        "user_id": uid,
-        "user_full_name": user.full_name,
-        "group_id": group_id,
-        "action": action,
-        "days": days,
-        "app_date": app_date,
-        "reason": reason
-    }
+        # Submit for approval (single-user flow) or run mass append
+        if st["flow"] in ("normal","ph"):
+            await send_approval_request(update, context, st)
+            # Clear live state: the token lives until admin handles request
+            user_state.pop(user.id, None)
+            return
 
-    # Build message
-    lines = [
-        f"🆕 *{human_action(action)} Request*",
-        f"👤 User: {user.full_name} ({uid})",
-        f"📅 Days: {fmt_days(days)}",
-        f"🗓 Application Date: {app_date}",
-        f"📝 Reason: {reason}",
-    ]
-    if action in {"clockoff", "claimoff"}:
-        lines += [
-            f"📊 Current Off: {fmt_days(current_off)} day(s)",
-            f"📈 New Balance: {fmt_days(new_off)} day(s)"
-        ]
-    text = "\n".join(lines)
+        if st["flow"] in ("mass_normal", "mass_ph"):
+            await run_mass_append(update, context, st)
+            user_state.pop(user.id, None)
+            return
 
-    rm = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{token}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{token}")
-    ]])
-
-    sent = await dm_admins(context, group_id, text, rm)
-    admin_message_refs[token] = sent
-    await update.message.reply_text("📩 Submitted to admins for approval.")
-
-async def submit_newuser_for_approval(update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict):
+# ---------------- Admin approval - single user ----------------
+async def send_approval_request(update:Update, context:ContextTypes.DEFAULT_TYPE, st:dict):
+    chat_id = st["group_id"]
     user = update.effective_user
-    uid = user.id
-    group_id = st["group_id"]
-
-    token = short_token()
-    pending_tokens[token] = {
-        "kind": "newuser",
-        "user_id": uid,
-        "user_full_name": user.full_name,
-        "group_id": group_id,
-        "import_days": float(st.get("import_days", 0.0)),
-        "ph_entries": list(st.get("ph_entries", []))
-    }
-
-    ph_lines = []
-    for i, entry in enumerate(pending_tokens[token]["ph_entries"], 1):
-        ph_lines.append(f"• {entry['app_date']} – {entry['reason']}")
-
-    text = (
-        "🆕 *Onboarding Request*\n"
-        f"👤 User: {user.full_name} ({uid})\n"
-        f"🧮 Normal OIL to import: {fmt_days(pending_tokens[token]['import_days'])}\n"
-        f"🏖 PH Entries ({len(ph_lines)}):\n" + ("\n".join(ph_lines) if ph_lines else "• None")
-    )
-
-    rm = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{token}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{token}")
-    ]])
-
-    sent = await dm_admins(context, group_id, text, rm)
-    admin_message_refs[token] = sent
-    await update.message.reply_text("📩 Submitted to admins for approval. You’ll be notified in the group.")
-
-# ---------- Callback handler ----------
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
 
     try:
-        # Cancel
-        if data.startswith("cancel|"):
-            _, token = data.split("|", 1)
-            # Clear any states for this user that match token
-            for uid, st in list(user_state.items()):
-                if st.get("token") == token:
-                    user_state.pop(uid, None)
-                    break
-            await query.edit_message_text("🧹 Cancelled.")
-            return
+        all_rows = worksheet.get_all_values()
+        current_off, ph_total_prev = latest_balance_rows(all_rows, str(user.id))
+        days = float(st["days"])
+        action = st["action"]
+        app_date = st["app_date"]
+        reason = st["reason"]
 
-        # Calendar day chosen
-        if data.startswith("cal|"):
-            _, token, sel = data.split("|", 2)
-            # Find whose state has this token
-            for uid, st in user_state.items():
-                if st.get("token") == token and st.get("stage") in {"awaiting_date", "newuser_ph_date"}:
-                    st["app_date"] = sel
-                    if st["flow"] == "newuser" and st["stage"] == "newuser_ph_date":
-                        st["ph_current_date"] = sel
-                        st["stage"] = "newuser_ph_reason"
-                        await query.edit_message_text(f"PH Entry {st['ph_index']+1}/{st['ph_needed']} — Enter *Reason* (max {MAX_REMARKS_LEN} chars):", parse_mode="Markdown")
-                    else:
-                        st["stage"] = "awaiting_reason"
-                        await query.edit_message_text("📝 Enter reason (max 80 chars):")
-                    return
-            await query.edit_message_text("⚠️ This selection is no longer active.")
-            return
+        final_off, add_sub = compute_next_balances(action, current_off, days)
+        is_ph = action in ("clockphoff","claimphoff")
+        expiry = ph_expiry(app_date) if is_ph and action=="clockphoff" else ("N/A" if not is_ph else ph_expiry(app_date))
 
-        # Calendar navigation
-        if data.startswith("calnav|"):
-            _, token, month_iso = data.split("|", 2)
-            d = parse_date_yyyy_mm_dd(month_iso + "-01") if len(month_iso) == 10 else None
-            if not d:
-                d = date.today().replace(day=1)
-            await query.edit_message_reply_markup(reply_markup=build_calendar_markup(token, d))
-            return
+        # Build server-side approval payload
+        atok = new_token("approval", user.id, extra={"group_id": chat_id})
+        pending_requests[atok] = {
+            "user_id": user.id,
+            "user_name": user.full_name,
+            "action": action,
+            "days": days,
+            "app_date": app_date,
+            "reason": reason,
+            "current_off": current_off,
+            "final_off": final_off,
+            "add_sub": add_sub,
+            "is_ph": is_ph,
+            "expiry": expiry,
+        }
 
-        # Manual entry choice
-        if data.startswith("manual|"):
-            _, token = data.split("|", 1)
-            await query.edit_message_text("✍️ Type the date as YYYY-MM-DD.")
-            return
+        # DM all admins
+        admins = await context.bot.get_chat_administrators(chat_id)
+        sent_to = 0
+        for a in admins:
+            if a.user.is_bot:
+                continue
+            try:
+                text = (
+                    f"🆕 *{('PH ' if is_ph else '')}{action.replace('off',' Off').title()} Request*\n\n"
+                    f"👤 User: {user.full_name} ({user.id})\n"
+                    f"📅 Days: {days}\n"
+                    f"🗓 Application Date: {app_date}\n"
+                    f"📝 Reason: {reason}\n\n"
+                    f"📊 Current Off: {current_off:.1f} day(s)\n"
+                )
+                if is_ph:
+                    text += f"🏖 PH Expiry: {pending_requests[atok]['expiry']}\n"
+                text += f"➡️ Final After: {final_off:.1f} day(s)"
 
-        # Mass confirm
-        if data.startswith("massgo|"):
-            _, token = data.split("|", 1)
-            # Find the requesting admin’s state
-            for uid, st in list(user_state.items()):
-                if st.get("token") == token and st.get("flow") in {"mass_normal", "mass_ph"} and st.get("stage") == "awaiting_reason":
-                    # Create a single approval token for this mass op
-                    mtoken = short_token()
-                    pending_tokens[mtoken] = {
-                        "kind": "mass",
-                        "who": st["mass_targets"],   # list of (uid_str, name)
-                        "group_id": st["group_id"],
-                        "action": st["action"],
-                        "days": float(st["days"]),
-                        "app_date": st["app_date"],
-                        "reason": st["reason"],
-                        "requester_name": user.full_name
-                    }
-                    rm = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{mtoken}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{mtoken}")
+                await context.bot.send_message(
+                    chat_id=a.user.id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{atok}"),
+                        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{atok}"),
                     ]])
-                    preview = f"👥 Mass {human_action(st['action'])}\nDays: {fmt_days(st['days'])}\nDate: {st['app_date']}\nReason: {st['reason']}\nTargets: {len(st['mass_targets'])}"
-                    sent = await dm_admins(context, st["group_id"], preview, rm)
-                    admin_message_refs[mtoken] = sent
-                    user_state.pop(uid, None)
-                    await query.edit_message_text("📩 Mass request submitted to admins.")
-                    return
-            await query.edit_message_text("⚠️ Mass request no longer active.")
+                )
+                sent_to += 1
+            except Exception as e:
+                log.warning("Cannot DM admin %s: %s", a.user.id, e)
+        if sent_to == 0:
+            await update.message.reply_text("⚠️ I couldn’t DM any admin. Ask an admin to /startadmin in PM.")
+        else:
+            await update.message.reply_text("📩 Submitted for approval. An admin will review shortly.")
+    except Exception:
+        log.exception("send_approval_request failed")
+        await update.message.reply_text("❌ Could not submit for approval.")
+
+# ---------------- Mass append ----------------
+async def run_mass_append(update:Update, context:ContextTypes.DEFAULT_TYPE, st:dict):
+    chat_id = st["group_id"]
+    user = update.effective_user
+    action = st["action"]
+    is_ph = action == "massclockphoff"
+
+    try:
+        # Admins already checked. Build distinct user list from sheet.
+        rows = worksheet.get_all_values()
+        people = {}
+        for r in rows:
+            if len(r) >= 3 and r[1].isdigit():
+                people[r[1]] = r[2] or r[1]
+
+        if not people:
+            await update.message.reply_text("ℹ️ No people found in the sheet yet.")
             return
 
-        # Approve / Deny
-        if data.startswith("approve|") or data.startswith("deny|"):
-            action_type, token = data.split("|", 1)
-            payload = pending_tokens.get(token)
-            if not payload:
-                await query.edit_message_text("⚠️ This request has expired or was already handled.")
-                return
+        # Perform append per person
+        appended = 0
+        for uid, name in people.items():
+            # Compute current balance per person from last row
+            user_rows = [r for r in rows if len(r)>=2 and r[1]==uid]
+            if user_rows:
+                last = user_rows[-1]
+                cur = safe_float(last[6]) or 0.0
+                try:
+                    prev_ph_total = float(last[11])
+                except:
+                    prev_ph_total = 0.0
+            else:
+                cur = 0.0
+                prev_ph_total = 0.0
 
-            # Clean up admin messages (others)
-            if token in admin_message_refs:
-                for admin_id, msg_id in admin_message_refs[token]:
-                    if admin_id != user.id:
-                        try:
-                            await context.bot.edit_message_text(
-                                chat_id=admin_id, message_id=msg_id,
-                                text=f"⚠️ Request handled by {user.full_name}."
-                            )
-                        except Exception:
-                            pass
+            days = float(st["days"])
+            if days <= 0:
+                continue  # safety
 
-            if action_type == "deny":
-                # Notify group / requester
-                kind = payload["kind"]
-                if kind == "single":
-                    gid = payload["group_id"]
-                    uname = payload.get("user_full_name") or str(payload["user_id"])
-                    await query.edit_message_text("❌ Request denied.")
-                    await context.bot.send_message(gid, text=f"❌ {uname}'s request was denied by {user.full_name}.")
-                elif kind == "mass":
-                    gid = payload["group_id"]
-                    await query.edit_message_text("❌ Mass request denied.")
-                    await context.bot.send_message(gid, text=f"❌ Mass request denied by {user.full_name}.")
-                else:  # newuser
-                    gid = payload["group_id"]
-                    uname = payload.get("user_full_name") or str(payload["user_id"])
-                    await query.edit_message_text("❌ Onboarding denied.")
-                    await context.bot.send_message(gid, text=f"❌ Onboarding for {uname} was denied by {user.full_name}.")
-                pending_tokens.pop(token, None)
-                admin_message_refs.pop(token, None)
-                return
+            final_off, add_sub = compute_next_balances(action, cur, days)
+            app_date = st["app_date"]
+            reason = st["reason"]
 
-            # APPROVAL path
-            kind = payload["kind"]
+            holiday_flag = "Yes" if is_ph else "No"
+            expiry = ph_expiry(app_date) if is_ph else "N/A"
+            ph_total = prev_ph_total + days if is_ph else "N/A"
+
             now = datetime.now()
-            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            row = [
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                uid,
+                name,
+                ("Clock Off" if action=="massclockoff" else "Clock Off (PH)"),
+                f"{cur:.1f}",
+                add_sub,
+                f"{final_off:.1f}",
+                user.full_name,
+                app_date,
+                reason[:MAX_REMARKS_LEN],
+                holiday_flag,
+                f"{ph_total}" if is_ph else "N/A",
+                expiry
+            ]
+            worksheet.append_row(row)
+            appended += 1
 
-            if kind == "single":
-                uid = str(payload["user_id"])
-                name = payload.get("user_full_name") or uid
-                gid = payload["group_id"]
-                action = payload["action"]
-                days = float(payload["days"])
-                app_date = payload["app_date"]
-                reason = payload["reason"]
+        await update.message.reply_text(f"✅ Mass append complete: {appended} people updated.")
+    except Exception:
+        log.exception("mass append failed")
+        await update.message.reply_text("❌ Mass append failed.")
 
-                current = get_current_off(uid)
-                final = current
-                add_subtract = ""
-                holiday_off = "No"
-                ph_total = ""
-                expiry = "N/A"
+# ---------------- Onboarding: preview & approval ----------------
+async def send_newuser_preview(update:Update, context:ContextTypes.DEFAULT_TYPE, st:dict):
+    user = update.effective_user
+    gid = st["group_id"]
 
-                if action == "clockoff":
-                    final = current + days
-                    add_subtract = f"+{fmt_days(days)}"
-                elif action == "claimoff":
-                    final = current - days
-                    add_subtract = f"-{fmt_days(days)}"
-                elif action == "clockphoff":
-                    # PH doesn’t change normal balance; track in PH Off Total, mark as Holiday Off
-                    holiday_off = "Yes"
-                    ph_total = f"+{fmt_days(days)}"
-                    # expiry = app_date + 365
-                    d = parse_date_yyyy_mm_dd(app_date)
-                    expiry = (d + timedelta(days=365)).isoformat() if d else "N/A"
-                    add_subtract = "±0"
-                elif action == "claimphoff":
-                    holiday_off = "Yes"
-                    ph_total = f"-{fmt_days(days)}"
-                    add_subtract = "±0"
-                else:
-                    add_subtract = "±0"
+    normal_days = st.get("nu_normal_days", 0.0)
+    ph_entries = st.get("nu_entries", [])
 
-                append_sheet_row(
-                    ts, uid, name, human_action(action),
-                    current, add_subtract, final,
-                    user.full_name, app_date, reason,
-                    holiday_off, ph_total, expiry
-                )
+    # Build approval payload
+    atok = new_token("approval", user.id, extra={"group_id": gid, "newuser": True})
+    pending_requests[atok] = {
+        "user_id": user.id,
+        "user_name": user.full_name,
+        "action": "newuser",
+        "normal_days": normal_days,
+        "ph_entries": ph_entries,  # list of {date, reason}
+    }
 
-                # keep info on the PM after handling
-                await query.edit_message_text(
-                    f"✅ Approved\n"
-                    f"{human_action(action)} — {name}\n"
-                    f"Days: {fmt_days(days)} | Date: {app_date}\n"
-                    f"Reason: {reason}\n"
-                    f"Final Off: {fmt_days(final)}"
-                )
+    # Send preview to admins
+    admins = await context.bot.get_chat_administrators(gid)
+    body = f"👤 *{user.full_name}* ({user.id})\n"
+    body += f"• Normal OIL to import: {normal_days}\n"
+    if ph_entries:
+        body += f"• PH entries ({len(ph_entries)}):\n"
+        for e in ph_entries:
+            body += f"  - {e['date']} — {e['reason']}\n"
+    else:
+        body += "• PH entries: (none)\n"
 
-                # group notify with name, not ID
-                await context.bot.send_message(
-                    gid,
-                    text=(f"✅ {name}'s {human_action(action)} approved by {user.full_name}.\n"
-                          f"📅 Days: {fmt_days(days)}\n"
-                          f"🗓 Application Date: {app_date}\n"
-                          f"📝 Reason: {reason}\n"
-                          f"📊 Final: {fmt_days(final)} day(s)")
-                )
+    sent = 0
+    for a in admins:
+        if a.user.is_bot:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=a.user.id,
+                text="🆕 *Onboarding Request*\n\n" + body,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve Import", callback_data=f"approve|{atok}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"deny|{atok}"),
+                ]])
+            )
+            sent += 1
+        except Exception as e:
+            log.warning("Cannot DM admin %s: %s", a.user.id, e)
 
-            elif kind == "mass":
-                gid = payload["group_id"]
-                days = float(payload["days"])
-                app_date = payload["app_date"]
-                reason = payload["reason"]
-                action = payload["action"]
-                targets = payload["who"]
+    await update.message.reply_text(
+        "📩 Submitted to admins for verification. You’ll be notified after approval."
+        if sent else "⚠️ I couldn’t DM any admin. Ask an admin to /startadmin in PM."
+    )
+    # keep token; clear live state
+    user_state.pop(user.id, None)
 
-                # Apply per target
-                for uid, name in targets:
-                    current = get_current_off(uid)
-                    final = current
-                    add_subtract = ""
-                    holiday_off = "No"
-                    ph_total = ""
-                    expiry = "N/A"
+# ---------------- Callback handler ----------------
+async def handle_callback(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()  # pre-answer so the spinner stops quickly
 
-                    if action == "clockoff":
-                        final = current + days
-                        add_subtract = f"+{fmt_days(days)}"
-                    elif action == "clockphoff":
-                        holiday_off = "Yes"
-                        ph_total = f"+{fmt_days(days)}"
-                        d = parse_date_yyyy_mm_dd(app_date)
-                        expiry = (d + timedelta(days=365)).isoformat() if d else "N/A"
-                        add_subtract = "±0"
-
-                    append_sheet_row(
-                        ts, str(uid), name or str(uid), human_action(action),
-                        current, add_subtract, final, user.full_name,
-                        app_date, reason, holiday_off, ph_total, expiry
-                    )
-
-                await query.edit_message_text(
-                    f"✅ Mass {human_action(action)} approved.\n"
-                    f"Users: {len(targets)} | Days: {fmt_days(days)} | Date: {app_date}\nReason: {reason}"
-                )
-                await context.bot.send_message(
-                    gid,
-                    text=(f"✅ Mass {human_action(action)} approved by {user.full_name}.\n"
-                          f"👥 Users: {len(targets)}\n"
-                          f"📅 Days each: {fmt_days(days)}\n"
-                          f"🗓 Date: {app_date}\n"
-                          f"📝 Reason: {reason}")
-                )
-
-            else:  # newuser
-                uid = str(payload["user_id"])
-                name = payload.get("user_full_name") or uid
-                gid = payload["group_id"]
-                import_days = float(payload.get("import_days", 0.0))
-                ph_entries = payload.get("ph_entries", [])
-
-                # normal import row (if > 0)
-                if import_days > 0:
-                    current = get_current_off(uid)
-                    final = current + import_days
-                    append_sheet_row(
-                        ts, uid, name, "Clock Off",
-                        current, f"+{fmt_days(import_days)}", final,
-                        user.full_name, date.today().isoformat(), "Transfer from old record",
-                        "No", "", "N/A"
-                    )
-
-                # PH entries: each +1.0 (or whatever logic you prefer), expiry +365 from app date
-                for entry in ph_entries:
-                    app_date = entry["app_date"]
-                    reason = entry["reason"]
-                    d = parse_date_yyyy_mm_dd(app_date)
-                    expiry = (d + timedelta(days=365)).isoformat() if d else "N/A"
-                    # PH Off Total +1, doesn't affect normal balance
-                    current = get_current_off(uid)  # after import
-                    final = current
-                    append_sheet_row(
-                        ts, uid, name, "Clock PH Off",
-                        current, "±0", final,
-                        user.full_name, app_date, reason,
-                        "Yes", "+1", expiry
-                    )
-
-                await query.edit_message_text("✅ Onboarding approved and recorded.")
-                await context.bot.send_message(gid, text=f"✅ Onboarding for {name} approved by {user.full_name}.")
-
-            # cleanup
-            pending_tokens.pop(token, None)
-            admin_message_refs.pop(token, None)
+    try:
+        if data.startswith("x|"):
+            # Cancel button: x|<flow_token>
+            ftok = data.split("|",1)[1]
+            finfo = tokens.get(ftok)
+            uid = update.effective_user.id
+            # Clear state if belongs to user
+            if uid in user_state and user_state[uid].get("token")==ftok:
+                user_state.pop(uid, None)
+            await q.edit_message_text("🧹 Cancelled.")
             return
 
-        # No-op buttons
+        if data.startswith("approve|") or data.startswith("deny|"):
+            action, atok = data.split("|",1)
+            payload = pending_requests.get(atok)
+            if not payload:
+                await q.edit_message_text("⚠️ This request has already been handled.")
+                return
+
+            approver = update.effective_user.full_name
+            gid = tokens.get(atok, {}).get("extra", {}).get("group_id") or payload.get("group_id")
+
+            if payload.get("action") == "newuser":
+                # Apply onboarding import
+                await handle_newuser_apply(update, context, payload, action=="approve", approver)
+            else:
+                # Single-user normal/PH
+                await handle_single_apply(update, context, payload, action=="approve", approver)
+
+            # Mark the admin PM as resolved but retain details
+            status = "✅ Approved" if action=="approve" else "❌ Denied"
+            await q.edit_message_text(
+                f"{status} by {approver}.\n\n"
+                f"(Details retained above in this thread.)"
+            )
+
+            # Cleanup
+            pending_requests.pop(atok, None)
+            return
+
+        # Calendar handlers
+        if data.startswith("cal|") or data.startswith("calnav|") or data.startswith("manual|"):
+            await handle_calendar_click(update, context, data)
+            return
+
+        # harmless noop
         if data.startswith("noop|"):
             return
 
     except Exception:
-        logger.exception("❌ Failed to process callback")
+        log.exception("callback handling failed")
         try:
-            await query.edit_message_text("❌ Something went wrong.")
-        except Exception:
+            await q.edit_message_text("❌ Something went wrong.")
+        except:
             pass
 
-# ---------- Webhook ----------
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    global telegram_app
-    if telegram_app is None:
-        logger.warning("⚠️ Telegram app not yet initialized.")
-        return "Bot not ready", 503
-    try:
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        logger.info(f"📨 Incoming update: {request.get_json(force=True)}")
-        fut = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
-        fut.add_done_callback(_callback)
-        return "OK"
-    except Exception:
-        logger.exception("❌ Error processing update")
-        return "Internal Server Error", 500
+# ---------------- Apply functions ----------------
+async def handle_single_apply(update:Update, context:ContextTypes.DEFAULT_TYPE, p:dict, approved:bool, approver_name:str):
+    chat_id = tokens.get(update.callback_query.data.split("|",1)[1], {}).get("extra", {}).get("group_id") or p.get("group_id")
 
-def _callback(fut):
-    try:
-        fut.result()
-    except Exception:
-        logger.exception("❌ Exception in handler")
+    uid = p["user_id"]
+    uname = p["user_name"]
+    action = p["action"]
+    days = float(p["days"])
+    app_date = p["app_date"]
+    reason = p["reason"]
+    is_ph = p["is_ph"]
 
-# ---------- Init ----------
+    # Resolve name in group (best-effort)
+    display = uname
+    try:
+        member = await context.bot.get_chat_member(chat_id, uid)
+        if member and member.user:
+            display = member.user.full_name or (f"@{member.user.username}" if member.user.username else uname)
+    except Exception:
+        pass
+
+    if not approved:
+        # Notify group
+        try:
+            await context.bot.send_message(chat_id=chat_id,
+                text=f"❌ {display}'s request was denied by {approver_name}.\n📝 Reason: {reason}")
+        except:
+            pass
+        return
+
+    # Approved: append to sheet
+    try:
+        all_rows = worksheet.get_all_values()
+        current_off, prev_ph_total = latest_balance_rows(all_rows, str(uid))
+        final_off, add_sub = compute_next_balances(action, current_off, days)
+
+        now = datetime.now()
+        holiday_flag = "Yes" if is_ph else "No"
+        expiry = ph_expiry(app_date) if is_ph else "N/A"
+        ph_total = (prev_ph_total + days) if (is_ph and "clock" in action) else \
+                   (prev_ph_total - days) if (is_ph and "claim" in action) else "N/A"
+
+        row = [
+            now.strftime("%Y-%m-%d %H:%M:%S"), # Timestamp
+            str(uid),                          # Telegram ID
+            uname,                             # Name
+            "Clock Off" if action=="clockoff" else
+            "Claim Off" if action=="claimoff" else
+            "Clock Off (PH)" if action=="clockphoff" else
+            "Claim Off (PH)",                  # Action
+            f"{current_off:.1f}",              # Current Off
+            add_sub,                           # Add/Subtract
+            f"{final_off:.1f}",                # Final Off
+            approver_name,                     # Approved By
+            app_date,                          # Application Date
+            reason[:MAX_REMARKS_LEN],          # Remarks
+            holiday_flag,                      # Holiday Off
+            f"{ph_total}" if is_ph else "N/A", # PH Off Total
+            expiry                             # Expiry
+        ]
+        worksheet.append_row(row)
+
+        # Notify group
+        msg = (
+            f"✅ {display}'s {action.replace('off',' Off')} approved by {approver_name}.\n"
+            f"📅 Days: {days}\n"
+            f"🗓 Application Date: {app_date}\n"
+            f"📝 Reason: {reason}\n"
+            f"📊 Final: {final_off:.1f} day(s)"
+        )
+        if is_ph:
+            msg += f"\n🏖 PH Expiry: {expiry}"
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception:
+        log.exception("sheet append failed (single)")
+        await context.bot.send_message(chat_id=chat_id, text="❌ Failed to record the approved request.")
+
+async def handle_newuser_apply(update:Update, context:ContextTypes.DEFAULT_TYPE, p:dict, approved:bool, approver_name:str):
+    gid = tokens.get(update.callback_query.data.split("|",1)[1], {}).get("extra", {}).get("group_id") or p.get("group_id")
+    uid = p["user_id"]
+    uname = p["user_name"]
+    normal_days = float(p.get("normal_days", 0.0))
+    ph_entries = p.get("ph_entries", [])
+
+    # Resolve display
+    display = uname
+    try:
+        member = await context.bot.get_chat_member(gid, uid)
+        if member and member.user:
+            display = member.user.full_name or (f"@{member.user.username}" if member.user.username else uname)
+    except Exception:
+        pass
+
+    if not approved:
+        try:
+            await context.bot.send_message(chat_id=gid, text=f"❌ Onboarding for {display} was denied by {approver_name}.")
+        except:
+            pass
+        return
+
+    try:
+        all_rows = worksheet.get_all_values()
+        current_off, prev_ph_total = latest_balance_rows(all_rows, str(uid))
+
+        now = datetime.now()
+        appended = 0
+
+        # 1) Import normal days (as a single Clock Off row), if any
+        if normal_days > 0:
+            final_off = current_off + normal_days
+            row = [
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                str(uid),
+                uname,
+                "Clock Off",
+                f"{current_off:.1f}",
+                f"+{normal_days}",
+                f"{final_off:.1f}",
+                approver_name,
+                today_str(),
+                "Transfer from old record",
+                "No",
+                "N/A",
+                "N/A"
+            ]
+            worksheet.append_row(row)
+            current_off = final_off
+            appended += 1
+
+        # 2) Import PH entries (each 1 day, with its provided date and reason)
+        ph_total = prev_ph_total
+        for e in ph_entries:
+            app_date = e["date"]
+            reason = e["reason"][:MAX_REMARKS_LEN]
+            expiry = ph_expiry(app_date)
+            ph_total += 1.0
+            row = [
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                str(uid),
+                uname,
+                "Clock Off (PH)",
+                f"{current_off:.1f}",
+                "+1.0",
+                f"{current_off:.1f}",
+                approver_name,
+                app_date,
+                reason,
+                "Yes",
+                f"{ph_total}",
+                expiry
+            ]
+            worksheet.append_row(row)
+            appended += 1
+
+        await context.bot.send_message(
+            chat_id=gid,
+            text=f"✅ Onboarding import for {display} completed by {approver_name}. ({appended} rows added)"
+        )
+    except Exception:
+        log.exception("newuser apply failed")
+        await context.bot.send_message(chat_id=gid, text="❌ Failed to record onboarding rows.")
+
+# ---------------- Init ----------------
 async def init_app():
     global telegram_app, worksheet
-    logger.info("🔐 Connecting to Google Sheets...")
+
+    log.info("🔐 Connecting to Google Sheets...")
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
     client = gspread.authorize(creds)
     worksheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-    logger.info("✅ Google Sheets ready.")
+    log.info("✅ Google Sheets ready.")
 
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
-    telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(CommandHandler("startadmin", startadmin))
-    telegram_app.add_handler(CommandHandler("summary", summary))
-    telegram_app.add_handler(CommandHandler("allsummary", summary))  # simple reuse; can expand
-    telegram_app.add_handler(CommandHandler("history", history))
 
-    telegram_app.add_handler(CommandHandler("clockoff", clockoff))
-    telegram_app.add_handler(CommandHandler("claimoff", claimoff))
-    telegram_app.add_handler(CommandHandler("clockphoff", clockphoff))
-    telegram_app.add_handler(CommandHandler("claimphoff", claimphoff))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(CommandHandler("startadmin", startadmin_cmd))
 
-    telegram_app.add_handler(CommandHandler("massclockoff", massclockoff))
-    telegram_app.add_handler(CommandHandler("massclockphoff", massclockphoff))
+    telegram_app.add_handler(CommandHandler("clockoff", clockoff_cmd))
+    telegram_app.add_handler(CommandHandler("claimoff", claimoff_cmd))
+    telegram_app.add_handler(CommandHandler("clockphoff", clockphoff_cmd))
+    telegram_app.add_handler(CommandHandler("claimphoff", claimphoff_cmd))
 
-    telegram_app.add_handler(CommandHandler("newuser", newuser))
+    telegram_app.add_handler(CommandHandler("massclockoff", massclockoff_cmd))
+    telegram_app.add_handler(CommandHandler("massclockphoff", massclockphoff_cmd))
+
+    telegram_app.add_handler(CommandHandler("newuser", newuser_cmd))
+
+    telegram_app.add_handler(CommandHandler("summary", summary_cmd))
+    telegram_app.add_handler(CommandHandler("history", history_cmd))
 
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info("🚀 Webhook set.")
+    log.info("🚀 Webhook set.")
 
-# ---------- Run ----------
+# ---------------- Run ----------------
 if __name__ == "__main__":
     nest_asyncio.apply()
     import threading
     threading.Thread(target=loop.run_forever, daemon=True).start()
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
-    logger.info("🟢 Starting Flask...")
+    log.info("🟢 Starting Flask...")
     app.run(host="0.0.0.0", port=10000)
