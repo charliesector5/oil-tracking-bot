@@ -809,7 +809,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if payload.get("type") == "newuser":
             await handle_newuser_apply(update, context, payload, kind == "approve", approver, approver_id)
-            # show same summary to tapper
             summary = build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=None)
             try:
                 await q.edit_message_text(summary)
@@ -827,10 +826,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if payload.get("type") in ("single",):
-            # handle single
-            # compute final for the tapper’s edited message after apply (we'll recompute inside too)
             await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
-            # for the tapper, display summary; final_off recompute quickly:
             final_off = None
             if kind == "approve":
                 cur = last_off_for_user(payload["user_id"])
@@ -947,6 +943,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
 
 # -----------------------------------------------------------------------------
 # Apply single (admin approve/deny) + send receipts + edit all admin PMs
+# (Duplicate-summary fix: no extra DM to approver; we only edit existing PMs.)
 # -----------------------------------------------------------------------------
 async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p.get("group_id")
@@ -964,14 +961,8 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(chat_id=gid, text=f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason}")
         except Exception:
             pass
-        # Update all admin DMs to summary (denied)
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
         await update_all_admin_pm(context, p, summary)
-        # Optional: receipt just for tapper
-        try:
-            await context.bot.send_message(chat_id=approver_id, text=summary)
-        except Exception:
-            pass
         return
 
     current_off = last_off_for_user(uid)
@@ -1015,18 +1006,12 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-    # Update all admin DMs to summary (approved)
     summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=final)
     await update_all_admin_pm(context, p, summary)
 
-    # Optional: receipt to approver
-    try:
-        await context.bot.send_message(chat_id=approver_id, text=summary)
-    except Exception:
-        pass
-
 # -----------------------------------------------------------------------------
 # Mass apply
+# (Duplicate-summary fix: remove approver DM receipts.)
 # -----------------------------------------------------------------------------
 async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str,Any]):
     gid = st["group_id"]
@@ -1094,10 +1079,6 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
         await update_all_admin_pm(context, p, summary)
-        try:
-            await context.bot.send_message(chat_id=approver_id, text=summary)
-        except Exception:
-            pass
         return
 
     count_ok = 0
@@ -1142,13 +1123,10 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
 
     summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
     await update_all_admin_pm(context, p, summary)
-    try:
-        await context.bot.send_message(chat_id=approver_id, text=summary)
-    except Exception:
-        pass
 
 # -----------------------------------------------------------------------------
 # Newuser apply
+# (Duplicate-summary fix: remove approver DM receipts.)
 # -----------------------------------------------------------------------------
 async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str,Any], via_edit: Optional[Any]=None):
     nu = st["newuser"]
@@ -1225,10 +1203,6 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
         await update_all_admin_pm(context, p, summary)
-        try:
-            await context.bot.send_message(chat_id=approver_id, text=summary)
-        except Exception:
-            pass
         return
 
     if normal_days > 0:
@@ -1295,10 +1269,6 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
 
     summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
     await update_all_admin_pm(context, p, summary)
-    try:
-        await context.bot.send_message(chat_id=approver_id, text=summary)
-    except Exception:
-        pass
 
 # -----------------------------------------------------------------------------
 # Webhook endpoints
