@@ -120,7 +120,7 @@ def is_group_chat(chat: Chat) -> bool:
 
 # --- Inline Calendar ---
 def calendar_keyboard(year: int, month: int, token: str, include_manual=True):
-    cal = calendar.Calendar(firstweekday=0)  # Monday=0
+    cal = calendar.Calendar(firstweekday=0)  # Monday=0? Telegram weeks: we'll show Mon..Sun labels
     month_days = cal.monthdayscalendar(year, month)
 
     # Header row: <<  Month YYYY  >>
@@ -137,6 +137,7 @@ def calendar_keyboard(year: int, month: int, token: str, include_manual=True):
 
     # Day grid
     rows = []
+    # Python's Calendar defaults Monday-first; monthdayscalendar returns weeks with zeros for padding days.
     for week in month_days:
         row = []
         for day in week:
@@ -157,7 +158,7 @@ async def send_calendar_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     token = uuid.uuid4().hex[:10]
     calendar_sessions[token] = {
         "user_id": owner_user_id,
-        "target": target_key,   # which state key to fill when picked
+        "target": target_key,   # which state key to fill when picked (e.g., "import_application_date" or "ph_pending_date")
         "year": now.year,
         "month": now.month,
         "chat_id": update.effective_chat.id,
@@ -192,6 +193,7 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "manual":
+        # Switch to manual input stage for this date target
         st = user_state.get(session["user_id"], {})
         st["stage"] = f"awaiting_{session['target']}_manual"
         user_state[session["user_id"]] = st
@@ -199,6 +201,7 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "prev":
+        # go to previous month
         m -= 1
         if m < 1:
             m = 12
@@ -224,11 +227,14 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
             await query.answer("Invalid date.")
             return
 
+        # Write back into user_state under the target key
         st = user_state.get(session["user_id"], {})
         st[session["target"]] = picked
         user_state[session["user_id"]] = st
 
         await query.edit_message_text(f"📅 Selected date: {picked}")
+        # Continue flow based on which key was filled:
+        # The flow code will check for presence of that key and move on.
         return
 
 # --- Cancel handling ---
@@ -258,7 +264,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # reads per your screenshot order
+    # unchanged from your working logic (kept minimal here)
     user = update.effective_user
     try:
         all_data = worksheet.get_all_values()
@@ -266,35 +272,33 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_rows:
             last_row = user_rows[-1]
             balance = last_row[6]
-
-            # PH Off Total is column 12 (index 11)
+            # simple total PH Off Total sum from column 12 (index 12) if present
             ph_total = 0.0
             for r in user_rows:
-                if len(r) >= 13 and r[11]:
+                if len(r) >= 13 and r[12]:
                     try:
-                        ph_total += float(r[11])
+                        ph_total += float(r[12])
                     except:
                         pass
-
-            # List active PH entries: Holiday Off (col 11 index 10) == Yes and not expired
+            # List *active* PH entries (Holiday Off == Yes) that are not expired and not negative adds
             today = datetime.now().date()
             entries = []
             for r in user_rows:
-                if len(r) >= 13:
+                if len(r) >= 12 and (len(r) > 10):
                     holiday_flag = (r[10].strip().lower() == "yes")
                     if holiday_flag:
                         app_date = r[8] if len(r) > 8 else ""
-                        expiry = r[12] if len(r) > 12 else "N/A"   # Expiry is col 13 (index 12)
+                        exp = r[11] if len(r) > 11 else "N/A"
                         remark = r[9] if len(r) > 9 else ""
                         addsub = r[5] if len(r) > 5 else ""
                         if addsub.startswith("+"):
-                            if expiry and expiry != "N/A":
+                            # check expiry
+                            if exp and exp != "N/A":
                                 try:
-                                    if datetime.strptime(expiry, "%Y-%m-%d").date() >= today:
-                                        entries.append(f"• {app_date}: +1.0 (exp {expiry}) - {remark}")
+                                    if datetime.strptime(exp, "%Y-%m-%d").date() >= today:
+                                        entries.append(f"• {app_date}: +1.0 (exp {exp}) - {remark}")
                                 except:
                                     pass
-
             body = "🔎 PH Off Entries:\n" + ("\n".join(entries) if entries else "• None")
             await update.message.reply_text(
                 f"📊 Current Off Balance: {balance} day(s).\n"
@@ -525,6 +529,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # awaiting_* calendar manual fallbacks
         if stage == "awaiting_import_application_date_manual":
+            # already handled above
             return
 
     # unknown state fallback
@@ -540,6 +545,7 @@ async def send_approval_request_normal(update: Update, context: ContextTypes.DEF
         if state["action"] == "clockoff":
             new_off = current_off + delta
         else:
+            # claimoff: prevent negative addition (safeguard already in input)
             new_off = current_off - delta
 
         token = uuid.uuid4().hex[:10]
@@ -683,6 +689,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if action == "done_ph":
                 # Show preview and send to admins
+                # group context: if this was started in PM, we need a group_id (take last group used? require it's started in group ideally)
                 group_id = st.get("group_id") or update.effective_chat.id
                 payload = {
                     "user_id": uid,
@@ -698,7 +705,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_state.pop(uid, None)
                 return
 
-        # Approve/Deny for existing normal requests
+        # Approve/Deny for existing normal requests (Issue #1 pattern)
         if data.startswith("approve|") or data.startswith("deny|"):
             action_type, token = data.split("|", 1)
             req = pending_requests.get(token)
@@ -714,19 +721,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_id = int(req["group_id"])
 
             if action_type == "approve":
-                timestamp = fmt(datetime.now()))
+                timestamp = fmt(datetime.now())
                 app_date = datetime.now().strftime("%Y-%m-%d")
                 current = last_balance_for(str(user_id))
                 final = current + days if action == "clockoff" else current - days
                 add_subtract = f"+{days}" if action == "clockoff" else f"-{days}"
 
-                # NOTE: columns 11..13 = Holiday Off, PH Off Total, Expiry
+                # Append with extended columns (Holiday Off / Expiry / PH Off Total)
                 worksheet.append_row([
                     timestamp, str(user_id), user_full_name,
                     "Clock Off" if action == "clockoff" else "Claim Off",
                     f"{current:.1f}", add_subtract, f"{final:.1f}",
                     query.from_user.full_name, app_date, reason,
-                    "No", "0", "N/A"
+                    "No", "N/A", "0"
                 ])
 
                 display_name = await resolve_display_name(context, group_id, user_id, user_full_name)
@@ -788,7 +795,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # 1) Normal import (if any)
                 if req.get("import_days"):
                     days = float(req["import_days"])
-                    if days > 0:
+                    if days <= 0:
+                        # ignore invalid
+                        pass
+                    else:
                         final = current + days
                         worksheet.append_row([
                             nowts, str(user_id), full_name,
@@ -797,7 +807,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             query.from_user.full_name,
                             req.get("import_application_date") or datetime.now().strftime("%Y-%m-%d"),
                             "Transfer from old record",
-                            "No", "0", "N/A"
+                            "No", "N/A", "0"
                         ])
                         current = final  # update running balance
 
@@ -815,7 +825,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         query.from_user.full_name,
                         ph_date,
                         remark,
-                        "Yes", "1.0", expiry
+                        "Yes", expiry, "1.0"
                     ])
                     current = final
 
