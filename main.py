@@ -17,7 +17,6 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    Message,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -98,16 +97,14 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
     Logic: FIFO across rows marked Holiday Off == 'Yes'.
     """
     rows = get_all_rows()
-    # Collect PH clocks and claims
     ph_events = []
     for r in rows[1:]:
         if len(r) < 13:
             continue
-        rid, name, action = r[1], r[2], r[3]
+        rid, action = r[1], r[3]
         is_ph = (len(r) >= 11 and (r[10].strip().lower() in ("yes", "y", "true", "1")))  # K: Holiday Off
         if rid != str(user_id) or not is_ph:
             continue
-        # quantity from Add/Subtract (F)
         qty_raw = r[5].strip() if len(r) > 5 else ""
         qty = 0.0
         if qty_raw:
@@ -117,7 +114,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
                 qty = 0.0
             if qty_raw.startswith("-"):
                 qty = -abs(qty)
-        # Application Date (I) and Expiry (M)
         app_date = r[8].strip() if len(r) > 8 else ""
         expiry = r[12].strip() if len(r) > 12 else ""
         reason = r[9].strip() if len(r) > 9 else ""  # J remarks
@@ -129,7 +125,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
             "reason": reason
         })
 
-    # Build active clocks: turn each +X into X units of 0.5 (or 1.0) but we’ll keep floating
     clocks = []
     for e in ph_events:
         if e["qty"] > 0:
@@ -140,7 +135,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
                 "qty": e["qty"]
             })
 
-    # Sort clocks by expiry asc (FIFO)
     def dparse(s):
         try:
             return datetime.strptime(s, "%Y-%m-%d").date()
@@ -148,7 +142,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
             return date(2100, 1, 1)
     clocks.sort(key=lambda x: dparse(x["expiry"]))
 
-    # Apply claims against clocks FIFO
     claims_total = sum(-e["qty"] for e in ph_events if e["qty"] < 0)
     for c in clocks:
         if claims_total <= 0:
@@ -157,7 +150,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
         c["qty"] -= use
         claims_total -= use
 
-    # Active entries are those with remaining qty > 0
     active = [c for c in clocks if c["qty"] > 0.0001]
     total_left = sum(c["qty"] for c in active)
     return (round(total_left, 3), active)
@@ -219,15 +211,66 @@ def cancel_keyboard(session_id: str) -> InlineKeyboardMarkup:
 def bold(s: str) -> str:
     return f"*{s}*"
 
-def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    # Try to check in chat; if fails, default allow
-    async def _inner():
+# -----------------------------------------------------------------------------
+# Helpers: Admin PM summary
+# -----------------------------------------------------------------------------
+def _label_from_action(action: str) -> str:
+    if action == "clockoff": return "Clock Off"
+    if action == "claimoff": return "Claim Off"
+    if action == "clockphoff": return "Clock PH Off"
+    if action == "claimphoff": return "Claim PH Off"
+    return action
+
+def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_off: float | None) -> str:
+    t = "✅ Approved" if approved else "❌ Denied"
+    if p["type"] == "single":
+        label = _label_from_action(p["action"])
+        lines = [
+            f"{t}",
+            f"{label} — {p['user_name']} ({p['user_id']})",
+            f"Days: {p['days']} | Date: {p['app_date']}",
+            f"Reason: {p.get('reason','') or '-'}",
+        ]
+        if p.get("is_ph") and p.get("expiry"):
+            lines.append(f"Expiry: {p['expiry']}")
+        if final_off is not None and approved:
+            lines.append(f"Final Off: {final_off:.1f}")
+        lines.append(f"Approved by: {approver_name}")
+        return "\n".join(lines)
+
+    if p["type"] == "mass":
+        label = "Mass Clock PH" if p["is_ph"] else "Mass Clock"
+        return "\n".join([
+            f"{t}",
+            f"{label}",
+            f"Days per user: {p['days']}",
+            f"Approved by: {approver_name}"
+        ])
+
+    if p["type"] == "newuser":
+        return "\n".join([
+            f"{t}",
+            f"Onboarding — {p['user_name']} ({p['user_id']})",
+            f"Normal OIL: {p.get('normal_days',0)}",
+            f"PH entries: {len(p.get('ph_entries',[]))}",
+            f"Approved by: {approver_name}"
+        ])
+
+    return f"{t} by {approver_name}"
+
+async def update_all_admin_pm(context: ContextTypes.DEFAULT_TYPE, payload: dict, summary_text: str):
+    for admin_id, msg_id in payload.get("admin_msgs", []):
         try:
-            admins = await context.bot.get_chat_administrators(chat_id)
-            return any(a.user.id == user_id for a in admins if not a.user.is_bot)
+            await context.bot.edit_message_text(
+                chat_id=admin_id,
+                message_id=msg_id,
+                text=summary_text
+            )
         except Exception:
-            return True
-    return asyncio.run_coroutine_threadsafe(_inner(), loop).result()
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=summary_text)
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # Helpers: Calendar
@@ -244,28 +287,24 @@ def build_calendar(session_id: str, cur: date) -> InlineKeyboardMarkup:
     """
     session_id ties callbacks to a user flow.
     callback_data patterns:
-      - noop|<sid>            (non-click headers)
-      - cal|<sid>|YYYY-MM-DD  (pick day)
-      - calnav|<sid>|YYYY-MM-01 (prev/next month nav)
-      - manual|<sid>          (switch to manual)
-      - cancel|<sid>          (cancel)
+      - noop|<sid>
+      - cal|<sid>|YYYY-MM-DD
+      - calnav|<sid>|YYYY-MM-01
+      - manual|<sid>
+      - cancel|<sid>
     """
     header = [InlineKeyboardButton(f"📅 {cur.strftime('%B %Y')}", callback_data=f"noop|{session_id}")]
     weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
     week_hdr = [InlineKeyboardButton(d, callback_data=f"noop|{session_id}") for d in weekdays]
 
-    # Determine first day-of-week and number of days
     first = month_start(cur)
     start_wd = first.weekday()  # Mon=0..Sun=6
-    # We want Sunday=0..Sat=6 for layout; convert
-    start_offset = (start_wd + 1) % 7
+    start_offset = (start_wd + 1) % 7  # make Sunday=0..Sat=6
 
-    # days in month
     next_m = month_add(first, 1)
     days_in_month = (next_m - first).days
 
     rows = []
-    # first row: may include blanks
     row = []
     for _ in range(start_offset):
         row.append(InlineKeyboardButton(" ", callback_data=f"noop|{session_id}"))
@@ -338,7 +377,7 @@ PIN_TEXT = (
 )
 
 # -----------------------------------------------------------------------------
-# Bot flows
+# Bot commands
 # -----------------------------------------------------------------------------
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
@@ -347,17 +386,13 @@ async def cmd_startadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please PM me and use /startadmin to begin the admin session.")
         return
-    # Mark session flag
     user_state[update.effective_user.id] = {"flow": "admin_session", "stage": "ready"}
     await update.message.reply_text("✅ Admin session started here. You’ll receive approval prompts in this PM.")
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
-    rows = get_all_rows()
-    # Normal off
     bal = last_off_for_user(uid)
-    # PH
     ph_total_left, active = compute_ph_entries_active(uid)
 
     lines = []
@@ -381,7 +416,6 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📜 No logs found.")
         return
     last5 = urows[-5:]
-    # Show: TimeStamp | Action | +/- -> Final | Remarks
     out = []
     for r in last5:
         ts = r[0] if len(r) > 0 else ""
@@ -394,7 +428,6 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------- Generic 1:1 flows (normal + PH) -------------------------
 async def start_flow_days(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str, action: str, is_ph: bool):
-    """Kick off a days->reason->date dialog with inline Cancel and calendar."""
     uid = update.effective_user.id
     sid = str(uuid4())[:10]
     user_state[uid] = {
@@ -430,7 +463,6 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         await update.message.reply_text("Run this in the group you want to affect.")
         return
-    # Admin check
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
@@ -459,7 +491,6 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if chat.type == "private":
         await update.message.reply_text("Run this in the group you want to affect.")
         return
-    # Admin check
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
@@ -492,7 +523,6 @@ async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     sid = str(uuid4())[:10]
-    # Check if already has any rows; if yes, block
     rows = get_all_rows()
     exists = any(len(r) > 1 and r[1] == str(uid) for r in rows)
     if exists:
@@ -506,7 +536,7 @@ async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "group_id": chat.id,
         "newuser": {
             "normal_days": None,
-            "ph_entries": [],  # list of {date, reason}
+            "ph_entries": [],
         }
     }
     await update.message.reply_text(
@@ -526,7 +556,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text.lower() == "-quit":
-        st = user_state.pop(uid, None)
+        user_state.pop(uid, None)
         await update.message.reply_text("🧹 Cancelled.")
         return
 
@@ -534,9 +564,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st:
         return
 
-    # generic flows for normal/ph
     if st["stage"] == "awaiting_days":
-        # Validate number
         try:
             days = float(text)
             if days <= 0:
@@ -544,14 +572,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if st["flow"] in ("normal", "ph", "mass_normal", "mass_ph"):
                 if not (0.5 <= days <= 3.0) or not validate_half_step(days):
                     raise ValueError()
-            # For newuser normal_days (unrestricted), this branch won't run.
         except ValueError:
             await update.message.reply_text("❌ Invalid input. Enter 0.5 to 3.0 in 0.5 steps.", reply_markup=cancel_keyboard(st["sid"]))
             return
 
         st["days"] = days
         if st["flow"].startswith("mass_"):
-            # build dry-run list from sheet unique users (skip header)
             rows = get_all_rows()
             seen = {}
             for r in rows[1:]:
@@ -581,14 +607,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["stage"] = "mass_confirm"
             return
 
-        # Reason next
         st["stage"] = "awaiting_reason"
         await update.message.reply_text("📝 Enter reason (max 80 chars):", reply_markup=cancel_keyboard(st["sid"]))
         return
 
     if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_reason":
         st["reason"] = text[:80]
-        # ask for application date with calendar
         st["stage"] = "awaiting_app_date"
         cur = date.today()
         await update.message.reply_text(
@@ -598,7 +622,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # /newuser steps
     if st["flow"] == "newuser":
         nu = st["newuser"]
         if st["stage"] == "awaiting_normal_days":
@@ -629,7 +652,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             nu["ph_count"] = cnt
             if cnt == 0:
-                # go to submit
                 st["stage"] = "review_submit"
             else:
                 st["stage"] = "ph_reason"
@@ -649,10 +671,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif st["stage"] == "review_submit":
-            # Shouldn't get text here; handled via buttons
             pass
 
-    # manual app-date entry handling across flows
     if st.get("stage") == "awaiting_app_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
@@ -666,7 +686,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not d:
             await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
-        # save into newuser ph entry
         nu = st["newuser"]
         idx = st["ph_idx"]
         nu["ph_entries"][idx]["date"] = d
@@ -681,7 +700,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # -----------------------------------------------------------------------------
-# Calendar callbacks & others
+# Callback handler
 # -----------------------------------------------------------------------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query:
@@ -697,15 +716,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind = parts[0]
     sid = parts[1] if len(parts) > 1 else ""
 
-    # find user state by sid (for group flows; state is per user)
     uid = q.from_user.id
     st = user_state.get(uid)
-    if not st or st.get("sid") != sid:
-        # calendar nav/noop still ok to ignore silently
-        if kind in ("noop", "cal", "calnav", "manual"):
-            return
-        await q.edit_message_text("⚠️ This session is no longer active.")
-        return
 
     if kind == "cancel":
         user_state.pop(uid, None)
@@ -718,8 +730,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "noop":
         return
 
+    # Calendar navigation / selection requires active state
+    if kind in ("calnav", "manual", "cal"):
+        if not st or st.get("sid") != sid:
+            return
+
     if kind == "calnav":
-        # redraw
         try:
             target = datetime.strptime(parts[2], "%Y-%m-%d").date()
         except Exception:
@@ -727,7 +743,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await q.edit_message_reply_markup(reply_markup=build_calendar(sid, target))
         except Exception:
-            # some clients require edit_text to refresh
             await q.edit_message_text(
                 f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
                 parse_mode="Markdown",
@@ -736,7 +751,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "manual":
-        # switch to manual entry for whichever stage we are in
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             st["stage"] = "awaiting_app_date_manual"
             await q.edit_message_text("⌨️ Type the application date as YYYY-MM-DD.", reply_markup=cancel_keyboard(sid))
@@ -771,7 +785,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await newuser_review(update, context, st, via_edit=q)
             return
 
-    if kind == "massgo" and st.get("stage") == "mass_confirm":
+    if kind == "massgo" and st and st.get("stage") == "mass_confirm":
         await mass_send_to_admins(update, context, st)
         try:
             await q.edit_message_text("Submitted to admins for approval.")
@@ -780,7 +794,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state.pop(uid, None)
         return
 
-    # Approve/deny paths come with key tokens into pending_payloads
+    # Approve/deny
     if kind in ("approve", "deny"):
         key = parts[1] if len(parts) > 1 else ""
         payload = pending_payloads.pop(key, None)
@@ -793,18 +807,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
-        # Apply according to type
         if payload.get("type") == "newuser":
             await handle_newuser_apply(update, context, payload, kind == "approve", approver, approver_id)
-        elif payload.get("type") in ("single", "mass"):
-            await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
+            # show same summary to tapper
+            summary = build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=None)
+            try:
+                await q.edit_message_text(summary)
+            except Exception:
+                pass
+            return
 
-        # Edit the PM message to reflect handled
-        try:
-            await q.edit_message_text(("✅ Approved" if kind == "approve" else "❌ Denied") + " and recorded.")
-        except Exception:
-            pass
-        return
+        if payload.get("type") == "mass":
+            await handle_mass_apply(context, payload, kind == "approve", approver, approver_id)
+            summary = build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=None)
+            try:
+                await q.edit_message_text(summary)
+            except Exception:
+                pass
+            return
+
+        if payload.get("type") in ("single",):
+            # handle single
+            # compute final for the tapper’s edited message after apply (we'll recompute inside too)
+            await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
+            # for the tapper, display summary; final_off recompute quickly:
+            final_off = None
+            if kind == "approve":
+                cur = last_off_for_user(payload["user_id"])
+                calc = cur + (payload["days"] if "clock" in payload["action"] else -payload["days"])
+                final_off = calc
+            try:
+                await q.edit_message_text(build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=final_off))
+            except Exception:
+                pass
+            return
 
 # -----------------------------------------------------------------------------
 # Finalize single (normal or PH) -> send to admins
@@ -814,23 +850,17 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     group_id = st.get("group_id") or (update.effective_chat.id if update.effective_chat else None)
 
-    # Protect: prevent claim negative effect by disallowing negatives entirely earlier
     days = float(st["days"])
-    if days <= 0:
-        await update.message.reply_text("❌ Days must be positive.")
-        user_state.pop(uid, None)
-        return
-    if not validate_half_step(days):
-        await update.message.reply_text("❌ Days must be in 0.5 steps.")
+    if days <= 0 or not validate_half_step(days):
+        await update.message.reply_text("❌ Days must be positive and in 0.5 steps.")
         user_state.pop(uid, None)
         return
 
-    # compute preview
     current_off = last_off_for_user(str(uid))
     add = +days if st["action"] in ("clockoff", "clockphoff") else -days
     final = current_off + add
     is_ph = st["is_ph"]
-    # expiry for PH clocks (claim doesn’t change expiry)
+
     expiry = ""
     ph_total_after = ""
     if is_ph:
@@ -840,11 +870,9 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
                 expiry = (d + timedelta(days=365)).strftime("%Y-%m-%d")
             except Exception:
                 expiry = ""
-        # compute ph total left after this op (for display)
         before, _ = compute_ph_entries_active(str(uid))
         ph_total_after = before + (days if st["action"] == "clockphoff" else -days)
 
-    # build payload
     key = str(uuid4())[:12]
     payload = {
         "type": "single",
@@ -860,10 +888,10 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         "is_ph": is_ph,
         "expiry": expiry,
         "ph_total_after": ph_total_after if ph_total_after != "" else None,
+        "admin_msgs": []
     }
-    pending_payloads[key] = payload
 
-    # send to each admin in the group
+    # send to admins and store PM refs
     try:
         admins = await context.bot.get_chat_administrators(group_id)
     except Exception:
@@ -892,19 +920,23 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     )
     if is_ph and expiry:
         text += f"\n🏖 PH Expiry: {expiry}"
-        # optional: show projected PH total
         if payload.get("ph_total_after") is not None:
             text += f"\n🏖 PH Total After: {payload['ph_total_after']:.1f}"
 
     sent_any = False
+    admin_msgs = []
     for a in admins:
         if a.user.is_bot:
             continue
         try:
-            await context.bot.send_message(chat_id=a.user.id, text=text, parse_mode="Markdown", reply_markup=kb)
+            msg = await context.bot.send_message(chat_id=a.user.id, text=text, parse_mode="Markdown", reply_markup=kb)
+            admin_msgs.append((a.user.id, msg.message_id))
             sent_any = True
         except Exception:
             pass
+
+    payload["admin_msgs"] = admin_msgs
+    pending_payloads[key] = payload
 
     if sent_any:
         await context.bot.send_message(chat_id=group_id, text="📩 Request submitted to admins for approval.")
@@ -914,7 +946,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     user_state.pop(uid, None)
 
 # -----------------------------------------------------------------------------
-# Apply single (admin approve/deny) + send receipts
+# Apply single (admin approve/deny) + send receipts + edit all admin PMs
 # -----------------------------------------------------------------------------
 async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p.get("group_id")
@@ -928,33 +960,29 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     expiry = p.get("expiry")
 
     if not approved:
-        # Inform group and admin receipt
         try:
             await context.bot.send_message(chat_id=gid, text=f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason}")
         except Exception:
             pass
-        # Admin PM receipt
-        receipt = f"❌ Denied — {uname} ({uid})\nAction: {action}\nDays: {days}\nApplication Date: {app_date}\nReason: {reason}"
-        if is_ph and expiry:
-            receipt += f"\nPH Expiry: {expiry}"
+        # Update all admin DMs to summary (denied)
+        summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
+        await update_all_admin_pm(context, p, summary)
+        # Optional: receipt just for tapper
         try:
-            await context.bot.send_message(chat_id=approver_id, text=receipt)
+            await context.bot.send_message(chat_id=approver_id, text=summary)
         except Exception:
             pass
         return
 
-    # Approved: compute new final (trust p["final_off"], but recompute for safety)
     current_off = last_off_for_user(uid)
     add = +days if "clock" in action else -days
     final = current_off + add
 
-    # PH total calculation for sheet
     ph_total_left, _ = compute_ph_entries_active(uid)
     ph_total_after = ph_total_left + (days if action == "clockphoff" else (-days if action == "claimphoff" else 0))
     if not is_ph:
         ph_total_after = 0.0
 
-    # Append to sheet
     try:
         append_row(
             user_id=uid,
@@ -973,7 +1001,6 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         log.exception("Failed to append row for single apply")
 
-    # Notify group
     msg = (
         f"✅ {uname}'s {('PH ' if is_ph else '')}{'Clock Off' if 'clock' in action else 'Claim Off'} approved by {approver_name}.\n"
         f"🗓 Application Date: {app_date}\n"
@@ -988,25 +1015,13 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-    # Admin PM receipt
-    label = (
-        "Clock Off" if action=="clockoff" else
-        "Claim Off" if action=="claimoff" else
-        "Clock Off (PH)" if action=="clockphoff" else
-        "Claim Off (PH)"
-    )
-    receipt = (
-        f"✅ Approved — {uname} ({uid})\n"
-        f"Action: {label}\n"
-        f"Days: {days}\n"
-        f"Application Date: {app_date}\n"
-        f"Reason: {reason}\n"
-        f"Final Off: {final:.1f}"
-    )
-    if is_ph and expiry:
-        receipt += f"\nPH Expiry: {expiry}"
+    # Update all admin DMs to summary (approved)
+    summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=final)
+    await update_all_admin_pm(context, p, summary)
+
+    # Optional: receipt to approver
     try:
-        await context.bot.send_message(chat_id=approver_id, text=receipt)
+        await context.bot.send_message(chat_id=approver_id, text=summary)
     except Exception:
         pass
 
@@ -1017,7 +1032,7 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
     gid = st["group_id"]
     days = st["days"]
     is_ph = st["is_ph"]
-    targets = st["mass_targets"]  # list of {user_id,name}
+    targets = st["mass_targets"]
 
     key = str(uuid4())[:12]
     payload = {
@@ -1025,9 +1040,9 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         "group_id": gid,
         "days": days,
         "is_ph": is_ph,
-        "targets": targets
+        "targets": targets,
+        "admin_msgs": []
     }
-    pending_payloads[key] = payload
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
@@ -1040,20 +1055,26 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🆕 *{label}* — Days per user: {days}\n\n"
         f"{listing}\n\nProceed?"
     )
-    # Send to admins
+
     try:
         admins = await context.bot.get_chat_administrators(gid)
     except Exception:
         admins = []
     sent = False
+    admin_msgs = []
     for a in admins:
         if a.user.is_bot:
             continue
         try:
-            await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
+            msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
+            admin_msgs.append((a.user.id, msg.message_id))
             sent = True
         except Exception:
             pass
+
+    payload["admin_msgs"] = admin_msgs
+    pending_payloads[key] = payload
+
     if sent:
         await context.bot.send_message(chat_id=gid, text="📩 Mass request sent to admins.")
     else:
@@ -1071,14 +1092,14 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
             await context.bot.send_message(chat_id=gid, text=f"❌ {label} denied by {approver_name}.")
         except Exception:
             pass
-        # PM receipt
+        summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
+        await update_all_admin_pm(context, p, summary)
         try:
-            await context.bot.send_message(chat_id=approver_id, text=f"❌ Denied — {label} ({len(targets)} users, {days} days each)")
+            await context.bot.send_message(chat_id=approver_id, text=summary)
         except Exception:
             pass
         return
 
-    # Approved: append for each target (clock only)
     count_ok = 0
     for t in targets:
         uid = t["user_id"]
@@ -1090,7 +1111,6 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
         expiry = ""
         ph_total_after = 0.0
         if is_ph:
-            # expiry from today (mass typically future replacement? admin chosen date is not asked)
             today = date.today()
             expiry = (today + timedelta(days=365)).strftime("%Y-%m-%d")
             before, _ = compute_ph_entries_active(uid)
@@ -1120,9 +1140,10 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
     except Exception:
         pass
 
-    # PM receipt
+    summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
+    await update_all_admin_pm(context, p, summary)
     try:
-        await context.bot.send_message(chat_id=approver_id, text=f"✅ Approved — {label}. Processed {count_ok}/{len(targets)} users, {days} days each.")
+        await context.bot.send_message(chat_id=approver_id, text=summary)
     except Exception:
         pass
 
@@ -1148,9 +1169,9 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
         "user_id": str(uid),
         "user_name": uname,
         "normal_days": float(nu["normal_days"] or 0.0),
-        "ph_entries": nu["ph_entries"],  # list of dicts
+        "ph_entries": nu["ph_entries"],
+        "admin_msgs": []
     }
-    pending_payloads[key] = payload
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
@@ -1158,20 +1179,25 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
     ]])
 
     txt = "🔎 *Import Review*\n" + "\n".join(lines)
-    # send to admins
+
     try:
         admins = await context.bot.get_chat_administrators(gid)
     except Exception:
         admins = []
     sent = False
+    admin_msgs = []
     for a in admins:
         if a.user.is_bot:
             continue
         try:
-            await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
+            msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
+            admin_msgs.append((a.user.id, msg.message_id))
             sent = True
         except Exception:
             pass
+
+    payload["admin_msgs"] = admin_msgs
+    pending_payloads[key] = payload
 
     if sent:
         if via_edit:
@@ -1197,14 +1223,14 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(chat_id=gid, text=f"❌ Onboarding import for {uname} denied by {approver_name}.")
         except Exception:
             pass
-        # PM receipt
+        summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
+        await update_all_admin_pm(context, p, summary)
         try:
-            await context.bot.send_message(chat_id=approver_id, text=f"❌ Denied — Onboarding import for {uname} ({uid})")
+            await context.bot.send_message(chat_id=approver_id, text=summary)
         except Exception:
             pass
         return
 
-    # Approved: append one row for normal days (if > 0), with remarks auto "Transfer from old record"
     if normal_days > 0:
         current = last_off_for_user(uid)
         add = +normal_days
@@ -1227,7 +1253,6 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             log.exception("Failed to append normal import for newuser")
 
-    # For each PH entry (force 1 day per entry)
     for e in ph_entries:
         dstr = e.get("date")
         reason = e.get("reason", "")
@@ -1243,7 +1268,6 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
             exp = (dt + timedelta(days=365)).strftime("%Y-%m-%d")
         except Exception:
             pass
-        # ph total after
         before, _ = compute_ph_entries_active(uid)
         ph_after = before + 1.0
         try:
@@ -1269,26 +1293,15 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
-    # PM receipt
-    ph_lines = "\n".join([f"  • {e['date']} — {e['reason']}" for e in ph_entries]) or "  • (none)"
-    receipt = (
-        f"✅ Approved — Onboarding import for {uname} ({uid})\n"
-        f"Normal OIL days: {normal_days}\n"
-        f"PH entries: {len(ph_entries)}\n{ph_lines}"
-    )
+    summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
+    await update_all_admin_pm(context, p, summary)
     try:
-        await context.bot.send_message(chat_id=approver_id, text=receipt)
+        await context.bot.send_message(chat_id=approver_id, text=summary)
     except Exception:
         pass
 
 # -----------------------------------------------------------------------------
-# Router for mass payloads in approve/deny
-# -----------------------------------------------------------------------------
-async def handle_mass_router(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
-    await handle_mass_apply(context, p, approved, approver_name, approver_id)
-
-# -----------------------------------------------------------------------------
-# Webhook endpoint
+# Webhook endpoints
 # -----------------------------------------------------------------------------
 @app.route("/")
 def index():
@@ -1319,13 +1332,10 @@ def webhook():
 # -----------------------------------------------------------------------------
 async def init_app():
     global telegram_app, worksheet
-    # Sheets
     gsheet_init()
 
-    # Telegram
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).get_updates_http_version("1.1").build()
 
-    # Commands
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CommandHandler("startadmin", cmd_startadmin))
     telegram_app.add_handler(CommandHandler("summary", cmd_summary))
@@ -1341,9 +1351,7 @@ async def init_app():
 
     telegram_app.add_handler(CommandHandler("newuser", cmd_newuser))
 
-    # Text replies
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Callbacks
     telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
     await telegram_app.initialize()
