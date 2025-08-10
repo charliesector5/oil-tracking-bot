@@ -286,7 +286,7 @@ async def update_all_admin_pm(context: ContextTypes.DEFAULT_TYPE, payload: dict,
                 pass
 
 # -----------------------------------------------------------------------------
-# Helpers: Calendar
+# Helpers: Calendar & Validation
 # -----------------------------------------------------------------------------
 def month_start(d: date) -> date:
     return date(d.year, d.month, 1)
@@ -296,7 +296,12 @@ def month_add(d: date, delta_months: int) -> date:
     m = (d.month - 1 + delta_months) % 12 + 1
     return date(y, m, 1)
 
-def build_calendar(session_id: str, cur: date) -> InlineKeyboardMarkup:
+def build_calendar(
+    session_id: str,
+    cur: date,
+    min_date: Optional[date] = None,
+    max_date: Optional[date] = None
+) -> InlineKeyboardMarkup:
     """
     session_id ties callbacks to a user flow.
     callback_data patterns:
@@ -305,6 +310,7 @@ def build_calendar(session_id: str, cur: date) -> InlineKeyboardMarkup:
       - calnav|<sid>|YYYY-MM-01
       - manual|<sid>
       - cancel|<sid>
+    Only dates within [min_date, max_date] are clickable.
     """
     header = [InlineKeyboardButton(f"📅 {cur.strftime('%B %Y')}", callback_data=f"noop|{session_id}")]
     weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
@@ -325,10 +331,18 @@ def build_calendar(session_id: str, cur: date) -> InlineKeyboardMarkup:
     while day <= days_in_month:
         while len(row) < 7 and day <= days_in_month:
             d = date(cur.year, cur.month, day)
-            row.append(InlineKeyboardButton(
-                f"{day}",
-                callback_data=f"cal|{session_id}|{d.strftime('%Y-%m-%d')}"
-            ))
+            in_range = True
+            if min_date and d < min_date:
+                in_range = False
+            if max_date and d > max_date:
+                in_range = False
+            if in_range:
+                row.append(InlineKeyboardButton(
+                    f"{day}",
+                    callback_data=f"cal|{session_id}|{d.strftime('%Y-%m-%d')}"
+                ))
+            else:
+                row.append(InlineKeyboardButton("·", callback_data=f"noop|{session_id}"))
             day += 1
         if len(row) < 7:
             while len(row) < 7:
@@ -336,19 +350,21 @@ def build_calendar(session_id: str, cur: date) -> InlineKeyboardMarkup:
         rows.append(row)
         row = []
 
+    prev_month = month_add(first, -1)
+    next_month = month_add(first, +1)
+    allow_prev = (min_date is None) or (prev_month >= date(min_date.year, min_date.month, 1))
+    allow_next = (max_date is None) or (next_month <= date(max_date.year, max_date.month, 1))
+
     nav = [
-        InlineKeyboardButton("« Prev", callback_data=f"calnav|{session_id}|{month_add(cur, -1).strftime('%Y-%m-01')}"),
+        InlineKeyboardButton("« Prev", callback_data=(f"calnav|{session_id}|{prev_month.strftime('%Y-%m-01')}" if allow_prev else f"noop|{session_id}")),
         InlineKeyboardButton("Manual entry", callback_data=f"manual|{session_id}"),
-        InlineKeyboardButton("Next »", callback_data=f"calnav|{session_id}|{month_add(cur, +1).strftime('%Y-%m-01')}")
+        InlineKeyboardButton("Next »", callback_data=(f"calnav|{session_id}|{next_month.strftime('%Y-%m-01')}" if allow_next else f"noop|{session_id}"))
     ]
     cancel = [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{session_id}")]
 
     keyboard = [header, week_hdr] + rows + [nav, cancel]
     return InlineKeyboardMarkup(keyboard)
 
-# -----------------------------------------------------------------------------
-# Validation helpers
-# -----------------------------------------------------------------------------
 def validate_half_step(x: float) -> bool:
     return abs((x * 10) % 5) < 1e-9
 
@@ -358,6 +374,31 @@ def parse_date_yyyy_mm_dd(s: str) -> Optional[str]:
         return d.strftime("%Y-%m-%d")
     except Exception:
         return None
+
+def validate_application_date(action: str, dstr: str) -> tuple[bool, str]:
+    """
+    Returns (ok, errmsg). dstr = 'YYYY-MM-DD'
+    Clocking (clockoff/clockphoff/newuser_ph/mass): today-365 .. today
+    Claiming (claimoff/claimphoff): today-365 .. today+365
+    """
+    try:
+        d = datetime.strptime(dstr, "%Y-%m-%d").date()
+    except Exception:
+        return False, "Invalid date format. Please use YYYY-MM-DD."
+
+    today = date.today()
+    past_365 = today - timedelta(days=365)
+    future_365 = today + timedelta(days=365)
+
+    is_clock = action in ("clockoff", "clockphoff", "newuser_ph", "mass")
+    if is_clock:
+        lo, hi = past_365, today
+    else:
+        lo, hi = past_365, future_365
+
+    if d < lo or d > hi:
+        return False, f"Date must be between {lo} and {hi}."
+    return True, ""
 
 # -----------------------------------------------------------------------------
 # Messaging snippets
@@ -399,8 +440,7 @@ async def cmd_startadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await reply_quiet(update, "Please PM me and use /startadmin to begin the admin session.")
         return
-    user_state[update.effective_user.id] = {"flow": "admin_session", "stage": "ready"}
-    # PM (keeps normal notification behavior)
+    user_state[update.effective_user.id] = {"flow": "admin_session", "stage": "ready", "owner_id": update.effective_user.id}
     await update.message.reply_text("✅ Admin session started here. You’ll receive approval prompts in this PM.")
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,12 +491,14 @@ async def start_flow_days(update: Update, context: ContextTypes.DEFAULT_TYPE, fl
         "stage": "awaiting_days",
         "group_id": update.effective_chat.id if update.effective_chat else None,
         "is_ph": is_ph,
+        "owner_id": uid,            # guard against cross-user presses
     }
     icon = "🏖" if is_ph else ("🗂" if action.startswith("claim") else "🕒")
     await reply_quiet(
         update,
         f"{icon} How many {'PH ' if is_ph else ''}OIL days do you want to "
-        f"{'clock' if 'clock' in action else 'claim'}? (0.5 to 3, in 0.5 steps)",
+        f"{'clock' if 'clock' in action else 'claim'}? (0.5 to 3, in 0.5 steps)\n"
+        f"– Date limits will be shown in the next step.",
         reply_markup=cancel_keyboard(sid)
     )
 
@@ -548,7 +590,8 @@ async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "newuser": {
             "normal_days": None,
             "ph_entries": [],
-        }
+        },
+        "owner_id": uid,
     }
     await reply_quiet(
         update,
@@ -591,22 +634,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         st["days"] = days
         cur = date.today()
+
+        # Set date limits
+        past_365 = date.today() - timedelta(days=365)
         if st["flow"].startswith("mass_"):
             st["stage"] = "awaiting_mass_date"
+            st["min_date"] = past_365
+            st["max_date"] = date.today()
             await reply_quiet(
                 update,
-                f"{bold('📅 Select the Application Date for the mass action:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
+                f"{bold('📅 Select the Application Date for the mass action:')}\n"
+                f"• Tap a date below, or tap {bold('Manual entry')} to type YYYY-MM-DD.\n"
+                f"• Allowed date range (clocking): {st['min_date']} to {st['max_date']}",
                 parse_mode="Markdown",
-                reply_markup=build_calendar(st["sid"], cur)
+                reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
             )
             return
 
         st["stage"] = "awaiting_app_date"
+        is_claim = st.get("action") in ("claimoff", "claimphoff")
+        st["min_date"] = past_365
+        st["max_date"] = date.today() + (timedelta(days=365) if is_claim else timedelta(days=0))
         await reply_quiet(
             update,
-            f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
+            f"{bold('📅 Select Application Date:')}\n"
+            f"• Tap a date below, or tap {bold('Manual entry')} to type YYYY-MM-DD.\n"
+            f"• Allowed date range: {st['min_date']} to {st['max_date']}",
             parse_mode="Markdown",
-            reply_markup=build_calendar(st["sid"], cur)
+            reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
         )
         return
 
@@ -646,8 +701,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["stage"] = "ph_ask_count"
             await reply_quiet(
                 update,
-                "Now we’ll import *PH OIL* entries. You’ll add them *one day at a time* with a date + PH name.\n"
-                "How many PH entries do you want to add? (Enter 0 if none)",
+                "Now we’ll import *PH OIL* entries.\n"
+                "How many PH entries do you want to add? (0–10)\n"
+                "You’ll add them one-by-one with date + PH name.",
                 parse_mode="Markdown",
                 reply_markup=cancel_keyboard(st["sid"])
             )
@@ -656,23 +712,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if st["stage"] == "ph_ask_count":
             try:
                 cnt = int(text)
-                if cnt < 0 or cnt > 50:
+                if cnt < 0 or cnt > 10:
                     raise ValueError()
             except ValueError:
-                await reply_quiet(update, "Enter an integer between 0 and 50.", reply_markup=cancel_keyboard(st["sid"]))
+                await reply_quiet(update, "Enter an integer between 0 and 10.", reply_markup=cancel_keyboard(st["sid"]))
                 return
             nu["ph_count"] = cnt
             if cnt == 0:
                 st["stage"] = "review_submit"
+                await newuser_review(update, context, st)
             else:
                 st["ph_idx"] = 0
                 st["stage"] = "ph_date"
+                st["min_date"] = date.today() - timedelta(days=365)
+                st["max_date"] = date.today()
                 cur = date.today()
                 await reply_quiet(
                     update,
-                    f"PH Entry 1/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
+                    f"PH Entry 1/{nu['ph_count']} — {bold('Select Application Date')} (YYYY-MM-DD)\n"
+                    f"• Allowed date range (clocking): {st['min_date']} to {st['max_date']}",
                     parse_mode="Markdown",
-                    reply_markup=build_calendar(st["sid"], cur)
+                    reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
                 )
             return
 
@@ -687,12 +747,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if idx < nu["ph_count"]:
                 st["ph_idx"] = idx
                 st["stage"] = "ph_date"
+                st["min_date"] = date.today() - timedelta(days=365)
+                st["max_date"] = date.today()
                 cur = date.today()
                 await reply_quiet(
                     update,
-                    f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
+                    f"PH Entry {idx+1}/{nu['ph_count']} — {bold('Select Application Date')} (YYYY-MM-DD)\n"
+                    f"• Allowed date range (clocking): {st['min_date']} to {st['max_date']}",
                     parse_mode="Markdown",
-                    reply_markup=build_calendar(st["sid"], cur)
+                    reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
                 )
             else:
                 st["stage"] = "review_submit"
@@ -704,6 +767,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d = parse_date_yyyy_mm_dd(text)
         if not d:
             await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
+            return
+        ok, msg = validate_application_date(st.get("action",""), d)
+        if not ok:
+            await reply_quiet(update, msg, reply_markup=cancel_keyboard(st["sid"]))
             return
         st["app_date"] = d
         st["stage"] = "awaiting_reason"
@@ -724,6 +791,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not d:
             await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
+        ok, msg = validate_application_date("mass", d)
+        if not ok:
+            await reply_quiet(update, msg, reply_markup=cancel_keyboard(st["sid"]))
+            return
         st["app_date"] = d
         st["stage"] = "awaiting_mass_remarks"
         await reply_quiet(update, "📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
@@ -735,8 +806,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not d:
             await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
+        ok, msg = validate_application_date("newuser_ph", d)
+        if not ok:
+            await reply_quiet(update, msg, reply_markup=cancel_keyboard(st["sid"]))
+            return
         nu = st["newuser"]
-        idx = st["ph_idx"]
+        idx = st.get("ph_idx", 0)
         nu["ph_entries"].append({"date": d, "reason": None})
         st["stage"] = "ph_reason"
         await reply_quiet(update, f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('PH name')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
@@ -762,7 +837,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     st = user_state.get(uid)
 
+    # Only the flow owner can operate inline controls
+    def _not_owner_block():
+        return (not st) or (st.get("sid") != sid) or (st.get("owner_id") != uid)
+
     if kind == "cancel":
+        if _not_owner_block():
+            await q.answer("This isn’t your session.", show_alert=True)
+            return
         user_state.pop(uid, None)
         try:
             await q.edit_message_text("🧹 Cancelled.")
@@ -773,8 +855,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "noop":
         return
 
+    # Calendar navigation / selection requires active state & ownership
     if kind in ("calnav", "manual", "cal"):
-        if not st or st.get("sid") != sid:
+        if _not_owner_block():
+            await q.answer("This isn’t your session.", show_alert=True)
             return
 
     if kind == "calnav":
@@ -782,13 +866,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target = datetime.strptime(parts[2], "%Y-%m-%d").date()
         except Exception:
             target = date.today()
+        min_d = st.get("min_date")
+        max_d = st.get("max_date")
         try:
-            await q.edit_message_reply_markup(reply_markup=build_calendar(sid, target))
+            await q.edit_message_reply_markup(reply_markup=build_calendar(sid, target, min_d, max_d))
         except Exception:
             await q.edit_message_text(
                 f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
                 parse_mode="Markdown",
-                reply_markup=build_calendar(sid, target)
+                reply_markup=build_calendar(sid, target, min_d, max_d)
             )
         return
 
@@ -810,6 +896,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "cal":
         chosen = parts[2]
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
+            ok, msg = validate_application_date(st.get("action",""), chosen)
+            if not ok:
+                await q.answer(msg, show_alert=True)
+                return
             st["app_date"] = chosen
             try:
                 await q.edit_message_text(f"📅 Application Date: {chosen}")
@@ -824,12 +914,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
             else:
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
-            await send_group_quiet(context, q.message.chat.id, prompt, reply_markup=cancel_keyboard(st["sid"])) \
-                if _is_group(update.effective_chat.type) else \
+            if update.effective_chat and _is_group(update.effective_chat.type):
+                await send_group_quiet(context, q.message.chat.id, prompt, reply_markup=cancel_keyboard(st["sid"]))
+            else:
                 await context.bot.send_message(chat_id=q.message.chat.id, text=prompt, reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_date":
+            ok, msg = validate_application_date("mass", chosen)
+            if not ok:
+                await q.answer(msg, show_alert=True)
+                return
             st["app_date"] = chosen
             try:
                 await q.edit_message_text(f"📅 Mass Application Date: {chosen}")
@@ -840,6 +935,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if st["flow"] == "newuser" and st["stage"] == "ph_date":
+            ok, msg = validate_application_date("newuser_ph", chosen)
+            if not ok:
+                await q.answer(msg, show_alert=True)
+                return
             nu = st["newuser"]
             idx = st["ph_idx"]
             nu["ph_entries"].append({"date": chosen, "reason": None})
@@ -852,6 +951,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if kind == "massgo" and st and st.get("stage") == "mass_confirm":
+        if _not_owner_block():
+            await q.answer("This isn’t your session.", show_alert=True)
+            return
         await mass_send_to_admins(update, context, st)
         try:
             await q.edit_message_text("Submitted to admins for approval.")
@@ -860,7 +962,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state.pop(uid, None)
         return
 
-    # Approve/deny
+    # Approve/deny (admin PM)
     if kind in ("approve", "deny"):
         key = parts[1] if len(parts) > 1 else ""
         payload = pending_payloads.pop(key, None)
@@ -922,6 +1024,14 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     add = +days if st["action"] in ("clockoff", "clockphoff") else -days
     final = current_off + add
     is_ph = st["is_ph"]
+    app_date = app_date or st.get("app_date","")
+
+    # date window double-check (defense-in-depth)
+    tag = st["action"]
+    ok, msg = validate_application_date(tag, app_date)
+    if not ok:
+        await reply_quiet(update, msg)
+        return
 
     expiry = ""
     ph_total_after = ""
@@ -991,7 +1101,6 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         if a.user.is_bot:
             continue
         try:
-            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=text, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent_any = True
@@ -1128,10 +1237,12 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "stage": "awaiting_days",
         "group_id": chat.id,
         "is_ph": False,
+        "owner_id": update.effective_user.id,
     }
     await reply_quiet(
         update,
-        "👥 Mass Clock *normal* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
+        "👥 Mass Clock *normal* OIL — How many days per user? (0.5 to 3, in 0.5 steps)\n"
+        "You’ll next choose a date (allowed: today-365 to today) and set a remark.",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard(sid)
     )
@@ -1156,10 +1267,12 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "stage": "awaiting_days",
         "group_id": chat.id,
         "is_ph": True,
+        "owner_id": update.effective_user.id,
     }
     await reply_quiet(
         update,
-        "👥 Mass Clock *PH* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
+        "👥 Mass Clock *PH* OIL — How many days per user? (0.5 to 3, in 0.5 steps)\n"
+        "You’ll next choose a date (allowed: today-365 to today) and set a PH name.",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard(sid)
     )
@@ -1205,7 +1318,6 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
         if a.user.is_bot:
             continue
         try:
-            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent = True
@@ -1324,7 +1436,9 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         "days": days,
         "is_ph": is_ph,
         "targets": targets,
-        "admin_msgs": []
+        "admin_msgs": [],
+        "reason": st.get("reason",""),
+        "app_date": st.get("app_date",""),
     }
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
@@ -1333,7 +1447,9 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
     label = "Mass Clock PH" if is_ph else "Mass Clock"
     listing = "\n".join([f"- {t['name']} ({t['user_id']})" for t in targets])
     txt = (
-        f"🆕 *{label}* — Days per user: {days}\n\n"
+        f"🆕 *{label}* — Days per user: {days}\n"
+        f"🗓 Date: {payload['app_date']}\n"
+        f"📝 Remarks: {payload['reason']}\n\n"
         f"{listing}\n\nProceed?"
     )
 
@@ -1347,7 +1463,6 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         if a.user.is_bot:
             continue
         try:
-            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent = True
@@ -1403,7 +1518,7 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
                 add_subtract=add,
                 final_off=final,
                 approved_by=approver_name,
-                application_date=date.today().strftime("%Y-%m-%d"),
+                application_date=p.get("app_date", date.today().strftime("%Y-%m-%d")),
                 remarks=p.get("reason","Mass clock"),
                 is_ph=is_ph,
                 ph_total=ph_total_after if is_ph else 0.0,
