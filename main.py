@@ -244,8 +244,6 @@ def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_
             f"{t}",
             f"{label}",
             f"Days per user: {p['days']}",
-            f"Date: {p.get('app_date','')}",
-            f"Remarks: {p.get('reason','') or '-'}",
             f"Approved by: {approver_name}"
         ])
 
@@ -459,11 +457,11 @@ async def cmd_clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_flow_days(update, context, "ph", "claimphoff", True)
 
-# ------------------- Mass clock (normal + PH) --------------------------------
-async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------- Admin overview ------------------------------------------
+async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == "private":
-        await update.message.reply_text("Run this in the group you want to affect.")
+        await update.message.reply_text("Run /overview in the group.")
         return
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
@@ -473,46 +471,46 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    sid = str(uuid4())[:10]
-    user_state[update.effective_user.id] = {
-        "sid": sid,
-        "flow": "mass_normal",
-        "stage": "awaiting_days",
-        "group_id": chat.id,
-        "is_ph": False,
-    }
-    await update.message.reply_text(
-        "👥 Mass Clock *normal* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=cancel_keyboard(sid)
-    )
+    rows = get_all_rows()
+    seen = {}
+    for r in rows[1:]:
+        if len(r) < 3:
+            continue
+        tid = r[1].strip()
+        name = r[2].strip() or tid
+        if not tid.isdigit():
+            continue
+        seen[tid] = name
 
-async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("Run this in the group you want to affect.")
+    if not seen:
+        await update.message.reply_text("No users found in sheet.")
         return
-    try:
-        admins = await context.bot.get_chat_administrators(chat.id)
-        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
-            await update.message.reply_text("Only admins can use this.")
-            return
-    except Exception:
-        pass
 
-    sid = str(uuid4())[:10]
-    user_state[update.effective_user.id] = {
-        "sid": sid,
-        "flow": "mass_ph",
-        "stage": "awaiting_days",
-        "group_id": chat.id,
-        "is_ph": True,
-    }
-    await update.message.reply_text(
-        "👥 Mass Clock *PH* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
-        parse_mode="Markdown",
-        reply_markup=cancel_keyboard(sid)
-    )
+    # Build roster
+    lines = ["📋 *OIL Overview*", ""]
+    for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
+        try:
+            normal = last_off_for_user(uid)
+            ph_left, _ = compute_ph_entries_active(uid)
+            lines.append(f"• {name} ({uid}) — Normal: {normal:.1f}d | PH: {ph_left:.1f}d")
+        except Exception:
+            lines.append(f"• {name} ({uid}) — Normal: ? | PH: ?")
+
+    # Chunk messages to avoid Telegram limits
+    out = ""
+    for line in lines:
+        if len(out) + len(line) + 1 > 3500:
+            try:
+                await update.message.reply_text(out, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(out)
+            out = ""
+        out += (line + "\n")
+    if out:
+        try:
+            await update.message.reply_text(out, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(out)
 
 # ------------------- Onboarding /newuser -------------------------------------
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,6 +562,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st:
         return
 
+    # ---- Days -> Date -> Remarks (single & mass) ----
     if st["stage"] == "awaiting_days":
         try:
             days = float(text)
@@ -577,20 +576,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         st["days"] = days
+        cur = date.today()
         if st["flow"].startswith("mass_"):
-            # Ask for remarks next (mass flows)
-            st["stage"] = "awaiting_mass_remarks"
-            await update.message.reply_text("📝 Enter remarks for this mass action (max 80 chars):", reply_markup=cancel_keyboard(st["sid"]))
+            # Days → Date → Remarks (mass)
+            st["stage"] = "awaiting_mass_date"
+            await update.message.reply_text(
+                f"{bold('📅 Select the Application Date for the mass action:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
+                parse_mode="Markdown",
+                reply_markup=build_calendar(st["sid"], cur)
+            )
             return
 
-        st["stage"] = "awaiting_reason"
-        await update.message.reply_text("📝 Enter reason (max 80 chars):", reply_markup=cancel_keyboard(st["sid"]))
-        return
-
-    if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_reason":
-        st["reason"] = text[:80]
+        # Days → Date → Remarks (single)
         st["stage"] = "awaiting_app_date"
-        cur = date.today()
         await update.message.reply_text(
             f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
             parse_mode="Markdown",
@@ -598,18 +596,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---- mass flow remarks -> date ----
-    if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_remarks":
-        st["reason"] = text[:80]
-        st["stage"] = "awaiting_mass_date"
-        cur = date.today()
-        await update.message.reply_text(
-            f"{bold('📅 Select the Application Date for the mass action:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
-            parse_mode="Markdown",
-            reply_markup=build_calendar(st["sid"], cur)
-        )
+    # ---- remarks after date (single) ----
+    if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_reason":
+        txt = text.strip()
+        action = st.get("action","")
+        # Optional remarks: claimoff and claimphoff (normal day).
+        optional = action in ("claimoff", "claimphoff")
+        if optional:
+            st["reason"] = ("—" if txt.lower() == "nil" or txt == "" else txt[:80])
+        else:
+            # Mandatory remarks: clockoff, clockphoff
+            if not txt or txt.lower() == "nil":
+                await update.message.reply_text("❌ Remarks required. Please provide a short reason (max 80 chars).", reply_markup=cancel_keyboard(st["sid"]))
+                return
+            st["reason"] = txt[:80]
+        # We already have the date from previous step
+        await finalize_single_request(update, context, st, st.get("app_date",""))
         return
 
+    # ---- remarks after date (mass) ----
+    if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_remarks":
+        st["reason"] = text[:80]
+        # We already have the date; build dry-run preview
+        await mass_preview_and_confirm(update, context, st)
+        return
+
+    # ---- /newuser flow ----
     if st["flow"] == "newuser":
         nu = st["newuser"]
         if st["stage"] == "awaiting_normal_days":
@@ -623,7 +635,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nu["normal_days"] = nd
             st["stage"] = "ph_ask_count"
             await update.message.reply_text(
-                "Now we’ll import *PH OIL* entries. You’ll add them *one day at a time* with a date + reason.\n"
+                "Now we’ll import *PH OIL* entries. You’ll add them *one day at a time* with a date + PH name.\n"
                 "How many PH entries do you want to add? (Enter 0 if none)",
                 parse_mode="Markdown",
                 reply_markup=cancel_keyboard(st["sid"])
@@ -642,31 +654,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cnt == 0:
                 st["stage"] = "review_submit"
             else:
-                st["stage"] = "ph_reason"
                 st["ph_idx"] = 0
-                await update.message.reply_text(f"PH Entry {st['ph_idx']+1}/{cnt} — Enter {bold('Reason')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
-                return
-
-        elif st["stage"] == "ph_reason":
-            nu["ph_entries"].append({"reason": text[:80], "date": None})
-            st["stage"] = "ph_date"
-            cur = date.today()
-            await update.message.reply_text(
-                f"PH Entry {st['ph_idx']+1}/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
-                parse_mode="Markdown",
-                reply_markup=build_calendar(st["sid"], cur)
-            )
+                st["stage"] = "ph_date"
+                cur = date.today()
+                await update.message.reply_text(
+                    f"PH Entry 1/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
+                    parse_mode="Markdown",
+                    reply_markup=build_calendar(st["sid"], cur)
+                )
             return
 
-        elif st["stage"] == "review_submit":
-            pass
+        elif st["stage"] == "ph_reason":
+            # Fill in reason for current index (date already chosen)
+            idx = st["ph_idx"]
+            txt = text.strip()
+            if not txt or txt.lower() == "nil":
+                await update.message.reply_text("❌ PH name is required. Please enter the PH name (e.g., National Day 2025).", reply_markup=cancel_keyboard(st["sid"]))
+                return
+            nu["ph_entries"][idx]["reason"] = txt[:80]
+            idx += 1
+            if idx < nu["ph_count"]:
+                st["ph_idx"] = idx
+                st["stage"] = "ph_date"
+                cur = date.today()
+                await update.message.reply_text(
+                    f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
+                    parse_mode="Markdown",
+                    reply_markup=build_calendar(st["sid"], cur)
+                )
+            else:
+                st["stage"] = "review_submit"
+                await newuser_review(update, context, st)
+            return
 
+    # ---- manual date entry (single) ----
     if st.get("stage") == "awaiting_app_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
             await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
-        await finalize_single_request(update, context, st, d)
+        # Store date then ask for remarks
+        st["app_date"] = d
+        st["stage"] = "awaiting_reason"
+        # Tailor remarks prompt
+        if st.get("action") == "clockoff":
+            prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
+        elif st.get("action") == "clockphoff":
+            prompt = "📝 Enter PH name (e.g., National Day 2025)."
+        elif st.get("action") == "claimoff":
+            prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
+        else:
+            prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
+        await update.message.reply_text(prompt, reply_markup=cancel_keyboard(st["sid"]))
         return
 
     # ---- manual date entry (mass) ----
@@ -676,9 +715,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
         st["app_date"] = d
-        await mass_preview_and_confirm(update, context, st)
+        st["stage"] = "awaiting_mass_remarks"
+        await update.message.reply_text("📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
         return
 
+    # ---- manual date entry for /newuser PH step ----
     if st.get("stage") == "ph_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
@@ -686,15 +727,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         nu = st["newuser"]
         idx = st["ph_idx"]
-        nu["ph_entries"][idx]["date"] = d
-        idx += 1
-        if idx < nu["ph_count"]:
-            st["ph_idx"] = idx
-            st["stage"] = "ph_reason"
-            await update.message.reply_text(f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('Reason')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
-        else:
-            st["stage"] = "review_submit"
-            await newuser_review(update, context, st)
+        # Create entry for this index with chosen date
+        nu["ph_entries"].append({"date": d, "reason": None})
+        st["stage"] = "ph_reason"
+        await update.message.reply_text(f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('PH name')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
         return
 
 # -----------------------------------------------------------------------------
@@ -766,11 +802,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "cal":
         chosen = parts[2]
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
-            await finalize_single_request(update, context, st, chosen)
+            st["app_date"] = chosen
             try:
                 await q.edit_message_text(f"📅 Application Date: {chosen}")
             except Exception:
                 pass
+            st["stage"] = "awaiting_reason"
+            # Tailor remarks prompt
+            if st.get("action") == "clockoff":
+                prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
+            elif st.get("action") == "clockphoff":
+                prompt = "📝 Enter PH name (e.g., National Day 2025)."
+            elif st.get("action") == "claimoff":
+                prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
+            else:
+                prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
+            await context.bot.send_message(chat_id=q.message.chat.id, text=prompt, reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_date":
@@ -779,21 +826,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(f"📅 Mass Application Date: {chosen}")
             except Exception:
                 pass
-            await mass_preview_and_confirm(update, context, st)
+            st["stage"] = "awaiting_mass_remarks"
+            await context.bot.send_message(chat_id=q.message.chat.id, text="📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"] == "newuser" and st["stage"] == "ph_date":
             nu = st["newuser"]
             idx = st["ph_idx"]
-            nu["ph_entries"][idx]["date"] = chosen
-            idx += 1
-            if idx < nu["ph_count"]:
-                st["ph_idx"] = idx
-                st["stage"] = "ph_reason"
-                await q.edit_message_text(f"PH Entry {idx}/{nu['ph_count']} saved.\n\nPH Entry {idx+1}/{nu['ph_count']} — Enter *Reason* (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(sid))
-            else:
-                st["stage"] = "review_submit"
-                await newuser_review(update, context, st, via_edit=q)
+            # Create entry for this index with chosen date
+            nu["ph_entries"].append({"date": chosen, "reason": None})
+            try:
+                await q.edit_message_text(f"📅 PH Entry {idx+1}/{nu['ph_count']} — Date: {chosen}")
+            except Exception:
+                pass
+            st["stage"] = "ph_reason"
+            await context.bot.send_message(chat_id=q.message.chat.id, text=f"PH Entry {idx+1}/{nu['ph_count']} — Enter *PH name* (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(sid))
             return
 
     if kind == "massgo" and st and st.get("stage") == "mass_confirm":
@@ -820,6 +867,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if payload.get("type") == "newuser":
             await handle_newuser_apply(update, context, payload, kind == "approve", approver, approver_id)
+            # show same summary to tapper
             summary = build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=None)
             try:
                 await q.edit_message_text(summary)
@@ -837,49 +885,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if payload.get("type") in ("single",):
-            # Apply and let handle_single_apply() update all admin PMs; don't recompute here
+            # handle single
+            # compute final for the tapper’s edited message after apply (we'll recompute inside too)
             await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
+            # for the tapper, display summary; final_off recompute quickly:
+            final_off = None
+            if kind == "approve":
+                cur = last_off_for_user(payload["user_id"])
+                calc = cur + (payload["days"] if "clock" in payload["action"] else -payload["days"])
+                final_off = calc
+            try:
+                await q.edit_message_text(build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=final_off))
+            except Exception:
+                pass
             return
-
-# -----------------------------------------------------------------------------
-# Helpers: Mass preview & send
-# -----------------------------------------------------------------------------
-async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str, Any]):
-    """Build the dry-run list once we have days + remarks + date."""
-    chat_id = st["group_id"]
-    rows = get_all_rows()
-    seen = {}
-    for r in rows[1:]:
-        if len(r) < 3:
-            continue
-        tid = r[1].strip()
-        name = r[2].strip()
-        if not tid.isdigit():
-            continue
-        seen[tid] = name or tid
-    if not seen:
-        await context.bot.send_message(chat_id=chat_id, text="No users found in sheet to mass clock.")
-        user_state.pop(next((k for k, v in user_state.items() if v is st), None), None)
-        return
-
-    st["mass_targets"] = [{"user_id": t, "name": n} for t, n in seen.items()]
-    st["stage"] = "mass_confirm"
-
-    listing = "\n".join([f"- {n} ({t})" for t, n in seen.items()])
-    txt = (
-        f"🔍 *Dry-run preview* ({len(seen)} users)\n"
-        f"Days per user: {st['days']}\n"
-        f"Date: {st['app_date']}\n"
-        f"Remarks: {st.get('reason','') or '-'}\n\n"
-        f"{listing}"
-    )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Proceed", callback_data=f"massgo|{st['sid']}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['sid']}")
-        ]
-    ])
-    await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown", reply_markup=kb)
 
 # -----------------------------------------------------------------------------
 # Finalize single (normal or PH) -> send to admins
@@ -952,8 +971,8 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         f"🆕 *{label} Request*\n\n"
         f"👤 User: {user.full_name} ({uid})\n"
         f"📅 Days: {days}\n"
-        f"📝 Reason: {st.get('reason','')}\n"
-        f"🗓 Application Date: {app_date}\n\n"
+        f"🗓 Application Date: {app_date}\n"
+        f"📝 Reason: {st.get('reason','') or '—'}\n\n"
         f"📊 Current Off: {current_off:.1f}\n"
         f"📈 New Balance: {final:.1f}"
     )
@@ -986,6 +1005,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
 
 # -----------------------------------------------------------------------------
 # Apply single (admin approve/deny) + send receipts + edit all admin PMs
+# (Duplicate-summary fix: no extra DM to approver; we only edit existing PMs.)
 # -----------------------------------------------------------------------------
 async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p.get("group_id")
@@ -1000,7 +1020,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not approved:
         try:
-            await context.bot.send_message(chat_id=gid, text=f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason}")
+            await context.bot.send_message(chat_id=gid, text=f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason or '—'}")
         except Exception:
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
@@ -1026,7 +1046,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             final_off=final,
             approved_by=approver_name,
             application_date=app_date,
-            remarks=reason,
+            remarks=reason or "—",
             is_ph=is_ph,
             ph_total=ph_total_after if is_ph else 0.0,
             expiry=expiry if is_ph else ""
@@ -1038,7 +1058,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✅ {uname}'s {('PH ' if is_ph else '')}{'Clock Off' if 'clock' in action else 'Claim Off'} approved by {approver_name}.\n"
         f"🗓 Application Date: {app_date}\n"
         f"📅 Days: {days}\n"
-        f"📝 Reason: {reason}\n"
+        f"📝 Reason: {reason or '—'}\n"
         f"📊 Final: {final:.1f} day(s)"
     )
     if is_ph and expiry:
@@ -1052,130 +1072,94 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update_all_admin_pm(context, p, summary)
 
 # -----------------------------------------------------------------------------
-# Mass apply
+# Mass preview & apply
 # -----------------------------------------------------------------------------
-async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str,Any]):
-    gid = st["group_id"]
-    days = st["days"]
-    is_ph = st["is_ph"]
-    targets = st["mass_targets"]
-
-    key = str(uuid4())[:12]
-    payload = {
-        "type": "mass",
-        "group_id": gid,
-        "days": days,
-        "is_ph": is_ph,
-        "targets": targets,
-        "app_date": st.get("app_date"),
-        "reason": st.get("reason",""),
-        "admin_msgs": []
-    }
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")
-    ]])
-
-    label = "Mass Clock PH" if is_ph else "Mass Clock"
-    listing = "\n".join([f"- {t['name']} ({t['user_id']})" for t in targets])
-    txt = (
-        f"🆕 *{label}* — Days per user: {days}\n"
-        f"🗓 Date: {payload['app_date']}\n"
-        f"📝 Remarks: {payload['reason'] or '-'}\n\n"
-        f"{listing}\n\nProceed?"
-    )
-
-    try:
-        admins = await context.bot.get_chat_administrators(gid)
-    except Exception:
-        admins = []
-    sent = False
-    admin_msgs = []
-    for a in admins:
-        if a.user.is_bot:
+async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str, Any]):
+    """Build the dry-run list once we have days + remarks + date."""
+    chat_id = st["group_id"]
+    rows = get_all_rows()
+    seen = {}
+    for r in rows[1:]:
+        if len(r) < 3:
             continue
-        try:
-            msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
-            admin_msgs.append((a.user.id, msg.message_id))
-            sent = True
-        except Exception:
-            pass
-
-    payload["admin_msgs"] = admin_msgs
-    pending_payloads[key] = payload
-
-    if sent:
-        await context.bot.send_message(chat_id=gid, text="📩 Mass request sent to admins.")
-    else:
-        await context.bot.send_message(chat_id=gid, text="⚠️ Couldn’t DM any admins.")
-
-async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
-    gid = p["group_id"]
-    days = p["days"]
-    is_ph = p["is_ph"]
-    targets = p["targets"]
-    app_date = p.get("app_date") or date.today().strftime("%Y-%m-%d")
-    remarks = p.get("reason","")
-    label = "Mass Clock PH" if is_ph else "Mass Clock"
-
-    if not approved:
-        try:
-            await context.bot.send_message(chat_id=gid, text=f"❌ {label} denied by {approver_name}.")
-        except Exception:
-            pass
-        summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
-        await update_all_admin_pm(context, p, summary)
+        tid = r[1].strip()
+        name = r[2].strip()
+        if not tid.isdigit():
+            continue
+        seen[tid] = name or tid
+    if not seen:
+        await context.bot.send_message(chat_id=chat_id, text="No users found in sheet to mass clock.")
+        user_state.pop(update.effective_user.id, None)
         return
 
-    count_ok = 0
-    for t in targets:
-        uid = t["user_id"]
-        uname = t["name"]
-        current_off = last_off_for_user(uid)
-        add = +days
-        final = current_off + add
+    listing = "\n".join([f"- {n} ({t})" for t, n in seen.items()])
+    st["mass_targets"] = [{"user_id": t, "name": n} for t, n in seen.items()]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Proceed", callback_data=f"massgo|{st['sid']}"),
+                                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['sid']}")]])
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔍 *Dry-run preview* ({len(seen)} users)\nDays per user: {st['days']}\nDate: {st.get('app_date','')}\nRemarks: {st.get('reason','')}\n\n{listing}",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+    st["stage"] = "mass_confirm"
 
-        expiry = ""
-        ph_total_after = 0.0
-        if is_ph:
-            try:
-                dt = datetime.strptime(app_date, "%Y-%m-%d").date()
-                expiry = (dt + timedelta(days=365)).strftime("%Y-%m-%d")
-            except Exception:
-                expiry = ""
-            before, _ = compute_ph_entries_active(uid)
-            ph_total_after = before + days
-
-        try:
-            append_row(
-                user_id=uid,
-                user_name=uname,
-                action="Clock Off",
-                current_off=current_off,
-                add_subtract=add,
-                final_off=final,
-                approved_by=approver_name,
-                application_date=app_date,
-                remarks=remarks or "Mass clock",
-                is_ph=is_ph,
-                ph_total=ph_total_after if is_ph else 0.0,
-                expiry=expiry if is_ph else ""
-            )
-            count_ok += 1
-        except Exception:
-            log.exception("Mass append failed for %s", uid)
-
+async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("Run this in the group you want to affect.")
+        return
     try:
-        await context.bot.send_message(chat_id=gid, text=f"✅ {label} approved by {approver_name}. Processed {count_ok}/{len(targets)} users.")
+        admins = await context.bot.get_chat_administrators(chat.id)
+        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
+            await update.message.reply_text("Only admins can use this.")
+            return
     except Exception:
         pass
 
-    summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
-    await update_all_admin_pm(context, p, summary)
+    sid = str(uuid4())[:10]
+    user_state[update.effective_user.id] = {
+        "sid": sid,
+        "flow": "mass_normal",
+        "stage": "awaiting_days",
+        "group_id": chat.id,
+        "is_ph": False,
+    }
+    await update.message.reply_text(
+        "👥 Mass Clock *normal* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard(sid)
+    )
+
+async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("Run this in the group you want to affect.")
+        return
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
+            await update.message.reply_text("Only admins can use this.")
+            return
+    except Exception:
+        pass
+
+    sid = str(uuid4())[:10]
+    user_state[update.effective_user.id] = {
+        "sid": sid,
+        "flow": "mass_ph",
+        "stage": "awaiting_days",
+        "group_id": chat.id,
+        "is_ph": True,
+    }
+    await update.message.reply_text(
+        "👥 Mass Clock *PH* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard(sid)
+    )
 
 # -----------------------------------------------------------------------------
-# Newuser apply
+# Newuser review & apply
 # -----------------------------------------------------------------------------
 async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str,Any], via_edit: Optional[Any]=None):
     nu = st["newuser"]
@@ -1320,6 +1304,120 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
     await update_all_admin_pm(context, p, summary)
 
 # -----------------------------------------------------------------------------
+# Mass apply
+# -----------------------------------------------------------------------------
+async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str,Any]):
+    gid = st["group_id"]
+    days = st["days"]
+    is_ph = st["is_ph"]
+    targets = st["mass_targets"]
+
+    key = str(uuid4())[:12]
+    payload = {
+        "type": "mass",
+        "group_id": gid,
+        "days": days,
+        "is_ph": is_ph,
+        "targets": targets,
+        "admin_msgs": []
+    }
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
+        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")
+    ]])
+
+    label = "Mass Clock PH" if is_ph else "Mass Clock"
+    listing = "\n".join([f"- {t['name']} ({t['user_id']})" for t in targets])
+    txt = (
+        f"🆕 *{label}* — Days per user: {days}\n\n"
+        f"{listing}\n\nProceed?"
+    )
+
+    try:
+        admins = await context.bot.get_chat_administrators(gid)
+    except Exception:
+        admins = []
+    sent = False
+    admin_msgs = []
+    for a in admins:
+        if a.user.is_bot:
+            continue
+        try:
+            msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
+            admin_msgs.append((a.user.id, msg.message_id))
+            sent = True
+        except Exception:
+            pass
+
+    payload["admin_msgs"] = admin_msgs
+    pending_payloads[key] = payload
+
+    if sent:
+        await context.bot.send_message(chat_id=gid, text="📩 Mass request sent to admins.")
+    else:
+        await context.bot.send_message(chat_id=gid, text="⚠️ Couldn’t DM any admins.")
+
+async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
+    gid = p["group_id"]
+    days = p["days"]
+    is_ph = p["is_ph"]
+    targets = p["targets"]
+    label = "Mass Clock PH" if is_ph else "Mass Clock"
+
+    if not approved:
+        try:
+            await context.bot.send_message(chat_id=gid, text=f"❌ {label} denied by {approver_name}.")
+        except Exception:
+            pass
+        summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
+        await update_all_admin_pm(context, p, summary)
+        return
+
+    count_ok = 0
+    for t in targets:
+        uid = t["user_id"]
+        uname = t["name"]
+        current_off = last_off_for_user(uid)
+        add = +days
+        final = current_off + add
+
+        expiry = ""
+        ph_total_after = 0.0
+        if is_ph:
+            today = date.today()
+            expiry = (today + timedelta(days=365)).strftime("%Y-%m-%d")
+            before, _ = compute_ph_entries_active(uid)
+            ph_total_after = before + days
+
+        try:
+            append_row(
+                user_id=uid,
+                user_name=uname,
+                action="Clock Off",
+                current_off=current_off,
+                add_subtract=add,
+                final_off=final,
+                approved_by=approver_name,
+                application_date=st.get("app_date", date.today().strftime("%Y-%m-%d")) if 'st' in locals() else date.today().strftime("%Y-%m-%d"),
+                remarks=p.get("reason","Mass clock"),
+                is_ph=is_ph,
+                ph_total=ph_total_after if is_ph else 0.0,
+                expiry=expiry if is_ph else ""
+            )
+            count_ok += 1
+        except Exception:
+            log.exception("Mass append failed for %s", uid)
+
+    try:
+        await context.bot.send_message(chat_id=gid, text=f"✅ {label} approved by {approver_name}. Processed {count_ok}/{len(targets)} users.")
+    except Exception:
+        pass
+
+    summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=None)
+    await update_all_admin_pm(context, p, summary)
+
+# -----------------------------------------------------------------------------
 # Webhook endpoints
 # -----------------------------------------------------------------------------
 @app.route("/")
@@ -1359,6 +1457,7 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("startadmin", cmd_startadmin))
     telegram_app.add_handler(CommandHandler("summary", cmd_summary))
     telegram_app.add_handler(CommandHandler("history", cmd_history))
+    telegram_app.add_handler(CommandHandler("overview", cmd_overview))
 
     telegram_app.add_handler(CommandHandler("clockoff", cmd_clockoff))
     telegram_app.add_handler(CommandHandler("claimoff", cmd_claimoff))
