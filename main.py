@@ -211,6 +211,19 @@ def cancel_keyboard(session_id: str) -> InlineKeyboardMarkup:
 def bold(s: str) -> str:
     return f"*{s}*"
 
+# --- Quiet send helpers (group messages are silent, PMs normal) ---
+def _is_group(chat_type: str) -> bool:
+    return chat_type in ("group", "supergroup")
+
+async def reply_quiet(update: Update, text: str, **kwargs):
+    if update.effective_chat and _is_group(update.effective_chat.type):
+        kwargs.setdefault("disable_notification", True)
+    return await update.message.reply_text(text, **kwargs)
+
+async def send_group_quiet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs):
+    kwargs.setdefault("disable_notification", True)
+    return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
 # -----------------------------------------------------------------------------
 # Helpers: Admin PM summary
 # -----------------------------------------------------------------------------
@@ -229,7 +242,7 @@ def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_
             f"{t}",
             f"{label} — {p['user_name']} ({p['user_id']})",
             f"Days: {p['days']} | Date: {p['app_date']}",
-            f"Reason: {p.get('reason','') or '-'}",
+            f"Reason: {p.get('reason','') or '—'}",
         ]
         if p.get("is_ph") and p.get("expiry"):
             lines.append(f"Expiry: {p['expiry']}")
@@ -380,13 +393,14 @@ PIN_TEXT = (
 # Bot commands
 # -----------------------------------------------------------------------------
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await reply_quiet(update, HELP_TEXT, parse_mode="Markdown")
 
 async def cmd_startadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        await update.message.reply_text("Please PM me and use /startadmin to begin the admin session.")
+        await reply_quiet(update, "Please PM me and use /startadmin to begin the admin session.")
         return
     user_state[update.effective_user.id] = {"flow": "admin_session", "stage": "ready"}
+    # PM (keeps normal notification behavior)
     await update.message.reply_text("✅ Admin session started here. You’ll receive approval prompts in this PM.")
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,7 +419,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("🔎 PH Off Entries (active): none")
 
-    await update.message.reply_text("\n".join(lines))
+    await reply_quiet(update, "\n".join(lines))
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -413,7 +427,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_rows()
     urows = [r for r in rows if len(r) > 1 and r[1] == uid]
     if not urows:
-        await update.message.reply_text("📜 No logs found.")
+        await reply_quiet(update, "📜 No logs found.")
         return
     last5 = urows[-5:]
     out = []
@@ -424,7 +438,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final = r[6] if len(r) > 6 else ""
         remarks = r[9] if len(r) > 9 else ""
         out.append(f"{ts} | {action} | {delta} → {final} | {remarks}")
-    await update.message.reply_text("📜 Your last 5 OIL logs:\n\n" + "\n".join(out))
+    await reply_quiet(update, "📜 Your last 5 OIL logs:\n\n" + "\n".join(out))
 
 # ------------------- Generic 1:1 flows (normal + PH) -------------------------
 async def start_flow_days(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str, action: str, is_ph: bool):
@@ -439,7 +453,8 @@ async def start_flow_days(update: Update, context: ContextTypes.DEFAULT_TYPE, fl
         "is_ph": is_ph,
     }
     icon = "🏖" if is_ph else ("🗂" if action.startswith("claim") else "🕒")
-    await update.message.reply_text(
+    await reply_quiet(
+        update,
         f"{icon} How many {'PH ' if is_ph else ''}OIL days do you want to "
         f"{'clock' if 'clock' in action else 'claim'}? (0.5 to 3, in 0.5 steps)",
         reply_markup=cancel_keyboard(sid)
@@ -466,7 +481,7 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
-            await update.message.reply_text("Only admins can use this.")
+            await reply_quiet(update, "Only admins can use this.")
             return
     except Exception:
         pass
@@ -483,10 +498,9 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen[tid] = name
 
     if not seen:
-        await update.message.reply_text("No users found in sheet.")
+        await reply_quiet(update, "No users found in sheet.")
         return
 
-    # Build roster
     lines = ["📋 *OIL Overview*", ""]
     for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
         try:
@@ -496,21 +510,20 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             lines.append(f"• {name} ({uid}) — Normal: ? | PH: ?")
 
-    # Chunk messages to avoid Telegram limits
     out = ""
     for line in lines:
         if len(out) + len(line) + 1 > 3500:
             try:
-                await update.message.reply_text(out, parse_mode="Markdown")
+                await reply_quiet(update, out, parse_mode="Markdown")
             except Exception:
-                await update.message.reply_text(out)
+                await reply_quiet(update, out)
             out = ""
         out += (line + "\n")
     if out:
         try:
-            await update.message.reply_text(out, parse_mode="Markdown")
+            await reply_quiet(update, out, parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text(out)
+            await reply_quiet(update, out)
 
 # ------------------- Onboarding /newuser -------------------------------------
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -524,7 +537,7 @@ async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_rows()
     exists = any(len(r) > 1 and r[1] == str(uid) for r in rows)
     if exists:
-        await update.message.reply_text("You already have records here. Import is only for brand-new users.")
+        await reply_quiet(update, "You already have records here. Import is only for brand-new users.")
         return
 
     user_state[uid] = {
@@ -537,7 +550,8 @@ async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ph_entries": [],
         }
     }
-    await update.message.reply_text(
+    await reply_quiet(
+        update,
         "🆕 *Onboarding: Import Old Records*\n\n"
         "1) How many *normal OIL* days to import? (Enter a number, e.g. 7.5 or 0 if none)",
         parse_mode="Markdown",
@@ -555,7 +569,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text.lower() == "-quit":
         user_state.pop(uid, None)
-        await update.message.reply_text("🧹 Cancelled.")
+        await reply_quiet(update, "🧹 Cancelled.")
         return
 
     st = user_state.get(uid)
@@ -572,24 +586,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not (0.5 <= days <= 3.0) or not validate_half_step(days):
                     raise ValueError()
         except ValueError:
-            await update.message.reply_text("❌ Invalid input. Enter 0.5 to 3.0 in 0.5 steps.", reply_markup=cancel_keyboard(st["sid"]))
+            await reply_quiet(update, "❌ Invalid input. Enter 0.5 to 3.0 in 0.5 steps.", reply_markup=cancel_keyboard(st["sid"]))
             return
 
         st["days"] = days
         cur = date.today()
         if st["flow"].startswith("mass_"):
-            # Days → Date → Remarks (mass)
             st["stage"] = "awaiting_mass_date"
-            await update.message.reply_text(
+            await reply_quiet(
+                update,
                 f"{bold('📅 Select the Application Date for the mass action:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
                 parse_mode="Markdown",
                 reply_markup=build_calendar(st["sid"], cur)
             )
             return
 
-        # Days → Date → Remarks (single)
         st["stage"] = "awaiting_app_date"
-        await update.message.reply_text(
+        await reply_quiet(
+            update,
             f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
             parse_mode="Markdown",
             reply_markup=build_calendar(st["sid"], cur)
@@ -600,24 +614,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_reason":
         txt = text.strip()
         action = st.get("action","")
-        # Optional remarks: claimoff and claimphoff (normal day).
         optional = action in ("claimoff", "claimphoff")
         if optional:
             st["reason"] = ("—" if txt.lower() == "nil" or txt == "" else txt[:80])
         else:
-            # Mandatory remarks: clockoff, clockphoff
             if not txt or txt.lower() == "nil":
-                await update.message.reply_text("❌ Remarks required. Please provide a short reason (max 80 chars).", reply_markup=cancel_keyboard(st["sid"]))
+                await reply_quiet(update, "❌ Remarks required. Please provide a short reason (max 80 chars).", reply_markup=cancel_keyboard(st["sid"]))
                 return
             st["reason"] = txt[:80]
-        # We already have the date from previous step
         await finalize_single_request(update, context, st, st.get("app_date",""))
         return
 
     # ---- remarks after date (mass) ----
     if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_remarks":
         st["reason"] = text[:80]
-        # We already have the date; build dry-run preview
         await mass_preview_and_confirm(update, context, st)
         return
 
@@ -630,11 +640,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if nd < 0:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text("Please enter a non-negative number (e.g., 0, 6, 7.5).", reply_markup=cancel_keyboard(st["sid"]))
+                await reply_quiet(update, "Please enter a non-negative number (e.g., 0, 6, 7.5).", reply_markup=cancel_keyboard(st["sid"]))
                 return
             nu["normal_days"] = nd
             st["stage"] = "ph_ask_count"
-            await update.message.reply_text(
+            await reply_quiet(
+                update,
                 "Now we’ll import *PH OIL* entries. You’ll add them *one day at a time* with a date + PH name.\n"
                 "How many PH entries do you want to add? (Enter 0 if none)",
                 parse_mode="Markdown",
@@ -648,7 +659,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if cnt < 0 or cnt > 50:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text("Enter an integer between 0 and 50.", reply_markup=cancel_keyboard(st["sid"]))
+                await reply_quiet(update, "Enter an integer between 0 and 50.", reply_markup=cancel_keyboard(st["sid"]))
                 return
             nu["ph_count"] = cnt
             if cnt == 0:
@@ -657,7 +668,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st["ph_idx"] = 0
                 st["stage"] = "ph_date"
                 cur = date.today()
-                await update.message.reply_text(
+                await reply_quiet(
+                    update,
                     f"PH Entry 1/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
                     parse_mode="Markdown",
                     reply_markup=build_calendar(st["sid"], cur)
@@ -665,11 +677,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif st["stage"] == "ph_reason":
-            # Fill in reason for current index (date already chosen)
             idx = st["ph_idx"]
             txt = text.strip()
             if not txt or txt.lower() == "nil":
-                await update.message.reply_text("❌ PH name is required. Please enter the PH name (e.g., National Day 2025).", reply_markup=cancel_keyboard(st["sid"]))
+                await reply_quiet(update, "❌ PH name is required. Please enter the PH name (e.g., National Day 2025).", reply_markup=cancel_keyboard(st["sid"]))
                 return
             nu["ph_entries"][idx]["reason"] = txt[:80]
             idx += 1
@@ -677,7 +688,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st["ph_idx"] = idx
                 st["stage"] = "ph_date"
                 cur = date.today()
-                await update.message.reply_text(
+                await reply_quiet(
+                    update,
                     f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('Application Date')} (YYYY-MM-DD):",
                     parse_mode="Markdown",
                     reply_markup=build_calendar(st["sid"], cur)
@@ -691,12 +703,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("stage") == "awaiting_app_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
-            await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
+            await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
-        # Store date then ask for remarks
         st["app_date"] = d
         st["stage"] = "awaiting_reason"
-        # Tailor remarks prompt
         if st.get("action") == "clockoff":
             prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
         elif st.get("action") == "clockphoff":
@@ -705,32 +715,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
         else:
             prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
-        await update.message.reply_text(prompt, reply_markup=cancel_keyboard(st["sid"]))
+        await reply_quiet(update, prompt, reply_markup=cancel_keyboard(st["sid"]))
         return
 
     # ---- manual date entry (mass) ----
     if st.get("stage") == "awaiting_mass_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
-            await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
+            await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
         st["app_date"] = d
         st["stage"] = "awaiting_mass_remarks"
-        await update.message.reply_text("📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
+        await reply_quiet(update, "📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
         return
 
     # ---- manual date entry for /newuser PH step ----
     if st.get("stage") == "ph_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
-            await update.message.reply_text("Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
+            await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
         nu = st["newuser"]
         idx = st["ph_idx"]
-        # Create entry for this index with chosen date
         nu["ph_entries"].append({"date": d, "reason": None})
         st["stage"] = "ph_reason"
-        await update.message.reply_text(f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('PH name')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
+        await reply_quiet(update, f"PH Entry {idx+1}/{nu['ph_count']} — Enter {bold('PH name')} (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(st["sid"]))
         return
 
 # -----------------------------------------------------------------------------
@@ -764,7 +773,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "noop":
         return
 
-    # Calendar navigation / selection requires active state
     if kind in ("calnav", "manual", "cal"):
         if not st or st.get("sid") != sid:
             return
@@ -808,7 +816,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             st["stage"] = "awaiting_reason"
-            # Tailor remarks prompt
             if st.get("action") == "clockoff":
                 prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
             elif st.get("action") == "clockphoff":
@@ -817,7 +824,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
             else:
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
-            await context.bot.send_message(chat_id=q.message.chat.id, text=prompt, reply_markup=cancel_keyboard(st["sid"]))
+            await send_group_quiet(context, q.message.chat.id, prompt, reply_markup=cancel_keyboard(st["sid"])) \
+                if _is_group(update.effective_chat.type) else \
+                await context.bot.send_message(chat_id=q.message.chat.id, text=prompt, reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"].startswith("mass_") and st["stage"] == "awaiting_mass_date":
@@ -827,20 +836,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             st["stage"] = "awaiting_mass_remarks"
-            await context.bot.send_message(chat_id=q.message.chat.id, text="📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
+            await send_group_quiet(context, q.message.chat.id, "📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"] == "newuser" and st["stage"] == "ph_date":
             nu = st["newuser"]
             idx = st["ph_idx"]
-            # Create entry for this index with chosen date
             nu["ph_entries"].append({"date": chosen, "reason": None})
             try:
                 await q.edit_message_text(f"📅 PH Entry {idx+1}/{nu['ph_count']} — Date: {chosen}")
             except Exception:
                 pass
             st["stage"] = "ph_reason"
-            await context.bot.send_message(chat_id=q.message.chat.id, text=f"PH Entry {idx+1}/{nu['ph_count']} — Enter *PH name* (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(sid))
+            await send_group_quiet(context, q.message.chat.id, f"PH Entry {idx+1}/{nu['ph_count']} — Enter *PH name* (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(sid))
             return
 
     if kind == "massgo" and st and st.get("stage") == "mass_confirm":
@@ -867,7 +875,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if payload.get("type") == "newuser":
             await handle_newuser_apply(update, context, payload, kind == "approve", approver, approver_id)
-            # show same summary to tapper
             summary = build_admin_summary_text(payload, approved=(kind=="approve"), approver_name=approver, final_off=None)
             try:
                 await q.edit_message_text(summary)
@@ -885,10 +892,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if payload.get("type") in ("single",):
-            # handle single
-            # compute final for the tapper’s edited message after apply (we'll recompute inside too)
             await handle_single_apply(update, context, payload, kind == "approve", approver, approver_id)
-            # for the tapper, display summary; final_off recompute quickly:
             final_off = None
             if kind == "approve":
                 cur = last_off_for_user(payload["user_id"])
@@ -910,7 +914,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
 
     days = float(st["days"])
     if days <= 0 or not validate_half_step(days):
-        await update.message.reply_text("❌ Days must be positive and in 0.5 steps.")
+        await reply_quiet(update, "❌ Days must be positive and in 0.5 steps.")
         user_state.pop(uid, None)
         return
 
@@ -937,7 +941,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         "user_id": str(uid),
         "user_name": user.full_name,
         "group_id": group_id,
-        "action": st["action"],      # clockoff/claimoff/clockphoff/claimphoff
+        "action": st["action"],
         "days": days,
         "reason": st.get("reason", ""),
         "app_date": app_date,
@@ -987,6 +991,7 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         if a.user.is_bot:
             continue
         try:
+            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=text, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent_any = True
@@ -997,15 +1002,14 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     pending_payloads[key] = payload
 
     if sent_any:
-        await context.bot.send_message(chat_id=group_id, text="📩 Request submitted to admins for approval.")
+        await send_group_quiet(context, group_id, "📩 Request submitted to admins for approval.")
     else:
-        await context.bot.send_message(chat_id=group_id, text="⚠️ Could not reach any admin. Please ensure the bot can PM admins.")
+        await send_group_quiet(context, group_id, "⚠️ Could not reach any admin. Please ensure the bot can PM admins.")
 
     user_state.pop(uid, None)
 
 # -----------------------------------------------------------------------------
 # Apply single (admin approve/deny) + send receipts + edit all admin PMs
-# (Duplicate-summary fix: no extra DM to approver; we only edit existing PMs.)
 # -----------------------------------------------------------------------------
 async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p.get("group_id")
@@ -1020,7 +1024,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not approved:
         try:
-            await context.bot.send_message(chat_id=gid, text=f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason or '—'}")
+            await send_group_quiet(context, gid, f"❌ Request by {uname} denied by {approver_name}.\n📝 Reason: {reason or '—'}")
         except Exception:
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
@@ -1064,7 +1068,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_ph and expiry:
         msg += f"\n🏖 PH Expiry: {expiry}"
     try:
-        await context.bot.send_message(chat_id=gid, text=msg)
+        await send_group_quiet(context, gid, msg)
     except Exception:
         pass
 
@@ -1075,7 +1079,6 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Mass preview & apply
 # -----------------------------------------------------------------------------
 async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str, Any]):
-    """Build the dry-run list once we have days + remarks + date."""
     chat_id = st["group_id"]
     rows = get_all_rows()
     seen = {}
@@ -1088,7 +1091,7 @@ async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT
             continue
         seen[tid] = name or tid
     if not seen:
-        await context.bot.send_message(chat_id=chat_id, text="No users found in sheet to mass clock.")
+        await send_group_quiet(context, chat_id, "No users found in sheet to mass clock.")
         user_state.pop(update.effective_user.id, None)
         return
 
@@ -1096,9 +1099,10 @@ async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT
     st["mass_targets"] = [{"user_id": t, "name": n} for t, n in seen.items()]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Proceed", callback_data=f"massgo|{st['sid']}"),
                                 InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['sid']}")]])
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔍 *Dry-run preview* ({len(seen)} users)\nDays per user: {st['days']}\nDate: {st.get('app_date','')}\nRemarks: {st.get('reason','')}\n\n{listing}",
+    await send_group_quiet(
+        context,
+        chat_id,
+        f"🔍 *Dry-run preview* ({len(seen)} users)\nDays per user: {st['days']}\nDate: {st.get('app_date','')}\nRemarks: {st.get('reason','')}\n\n{listing}",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -1112,7 +1116,7 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
-            await update.message.reply_text("Only admins can use this.")
+            await reply_quiet(update, "Only admins can use this.")
             return
     except Exception:
         pass
@@ -1125,7 +1129,8 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "group_id": chat.id,
         "is_ph": False,
     }
-    await update.message.reply_text(
+    await reply_quiet(
+        update,
         "👥 Mass Clock *normal* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard(sid)
@@ -1139,7 +1144,7 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
-            await update.message.reply_text("Only admins can use this.")
+            await reply_quiet(update, "Only admins can use this.")
             return
     except Exception:
         pass
@@ -1152,7 +1157,8 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "group_id": chat.id,
         "is_ph": True,
     }
-    await update.message.reply_text(
+    await reply_quiet(
+        update,
         "👥 Mass Clock *PH* OIL — How many days per user? (0.5 to 3, in 0.5 steps)",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard(sid)
@@ -1184,10 +1190,8 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
         "admin_msgs": []
     }
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")
-    ]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
+                                InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")]])
 
     txt = "🔎 *Import Review*\n" + "\n".join(lines)
 
@@ -1201,6 +1205,7 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
         if a.user.is_bot:
             continue
         try:
+            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent = True
@@ -1214,12 +1219,12 @@ async def newuser_review(update: Update, context: ContextTypes.DEFAULT_TYPE, st:
         if via_edit:
             await via_edit.edit_message_text("Submitted to admins for approval.")
         else:
-            await update.message.reply_text("Submitted to admins for approval.")
+            await send_group_quiet(context, gid, "Submitted to admins for approval.")
     else:
         if via_edit:
             await via_edit.edit_message_text("⚠️ Couldn’t reach any admin.")
         else:
-            await update.message.reply_text("⚠️ Couldn’t reach any admin.")
+            await send_group_quiet(context, gid, "⚠️ Couldn’t reach any admin.")
     user_state.pop(uid, None)
 
 async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
@@ -1231,7 +1236,7 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not approved:
         try:
-            await context.bot.send_message(chat_id=gid, text=f"❌ Onboarding import for {uname} denied by {approver_name}.")
+            await send_group_quiet(context, gid, f"❌ Onboarding import for {uname} denied by {approver_name}.")
         except Exception:
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
@@ -1296,7 +1301,7 @@ async def handle_newuser_apply(update: Update, context: ContextTypes.DEFAULT_TYP
             log.exception("Failed to append PH import for newuser")
 
     try:
-        await context.bot.send_message(chat_id=gid, text=f"✅ Onboarding import for {uname} approved by {approver_name}.")
+        await send_group_quiet(context, gid, f"✅ Onboarding import for {uname} approved by {approver_name}.")
     except Exception:
         pass
 
@@ -1322,10 +1327,8 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         "admin_msgs": []
     }
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")
-    ]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
+                                InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")]])
 
     label = "Mass Clock PH" if is_ph else "Mass Clock"
     listing = "\n".join([f"- {t['name']} ({t['user_id']})" for t in targets])
@@ -1344,6 +1347,7 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         if a.user.is_bot:
             continue
         try:
+            # Admin PMs: normal notifications
             msg = await context.bot.send_message(chat_id=a.user.id, text=txt, parse_mode="Markdown", reply_markup=kb)
             admin_msgs.append((a.user.id, msg.message_id))
             sent = True
@@ -1354,9 +1358,9 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
     pending_payloads[key] = payload
 
     if sent:
-        await context.bot.send_message(chat_id=gid, text="📩 Mass request sent to admins.")
+        await send_group_quiet(context, gid, "📩 Mass request sent to admins.")
     else:
-        await context.bot.send_message(chat_id=gid, text="⚠️ Couldn’t DM any admins.")
+        await send_group_quiet(context, gid, "⚠️ Couldn’t DM any admins.")
 
 async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p["group_id"]
@@ -1367,7 +1371,7 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
 
     if not approved:
         try:
-            await context.bot.send_message(chat_id=gid, text=f"❌ {label} denied by {approver_name}.")
+            await send_group_quiet(context, gid, f"❌ {label} denied by {approver_name}.")
         except Exception:
             pass
         summary = build_admin_summary_text(p, approved=False, approver_name=approver_name, final_off=None)
@@ -1399,7 +1403,7 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
                 add_subtract=add,
                 final_off=final,
                 approved_by=approver_name,
-                application_date=st.get("app_date", date.today().strftime("%Y-%m-%d")) if 'st' in locals() else date.today().strftime("%Y-%m-%d"),
+                application_date=date.today().strftime("%Y-%m-%d"),
                 remarks=p.get("reason","Mass clock"),
                 is_ph=is_ph,
                 ph_total=ph_total_after if is_ph else 0.0,
@@ -1410,7 +1414,7 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
             log.exception("Mass append failed for %s", uid)
 
     try:
-        await context.bot.send_message(chat_id=gid, text=f"✅ {label} approved by {approver_name}. Processed {count_ok}/{len(targets)} users.")
+        await send_group_quiet(context, gid, f"✅ {label} approved by {approver_name}. Processed {count_ok}/{len(targets)} users.")
     except Exception:
         pass
 
