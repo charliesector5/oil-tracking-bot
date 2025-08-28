@@ -413,7 +413,7 @@ HELP_TEXT = (
     "/massclockphoff – Admin: Mass clock PH OIL for all (with preview)\n"
     "/newuser – Import your old records (onboarding)\n"
     "/startadmin – Start admin session (PM only)\n"
-    "/summary – Your current balance & PH details\n"
+    "/summary – Your Total OIL Balance + breakdown\n"
     "/history – Your past 5 logs\n"
     "/help – Show this help message\n\n"
     "Tip: You can always tap ❌ Cancel or type -quit to abort."
@@ -423,7 +423,8 @@ PIN_TEXT = (
     "📌 *OIL Bot Quick Guide*  \n"
     "• Use /clockoff and /claimoff to add/claim normal OIL (0.5–3 days).  \n"
     "• Use /clockphoff and /claimphoff for *Public Holiday (PH)* OIL with 365-day expiry.  \n"
-    "• /summary shows your balance and each active PH entry with its expiry.  \n"
+    "• /summary shows your Total OIL balance (Normal + PH) and PH entries.  \n"
+    "• /overview shows a snapshot (totals, last action, soonest PH expiries).  \n"
     "• /history shows your last 5 logs.  \n"
     "• Admins: /massclockoff, /massclockphoff.  \n"
     "• New teammates: /newuser to import old records.  \n"
@@ -446,11 +447,14 @@ async def cmd_startadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
-    bal = last_off_for_user(uid)
+
+    bal = last_off_for_user(uid)  
     ph_total_left, active = compute_ph_entries_active(uid)
+    normal_bal = bal - ph_total_left
 
     lines = []
     lines.append(f"📊 Current Off Balance: {bal:.1f} day(s).")
+    lines.append(f"🗂 Normal OIL Balance: {normal_bal:.1f} day(s)")
     lines.append(f"🏖 PH Off Total: {ph_total_left:.1f} day(s)")
     if active:
         lines.append("🔎 PH Off Entries (active):")
@@ -515,6 +519,7 @@ async def cmd_claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_flow_days(update, context, "ph", "claimphoff", True)
 
 # ------------------- Admin overview ------------------------------------------
+
 async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == "private":
@@ -546,11 +551,14 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *OIL Overview*", ""]
     for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
         try:
-            normal = last_off_for_user(uid)
-            ph_left, _ = compute_ph_entries_active(uid)
-            lines.append(f"• {name} ({uid}) — Normal: {normal:.1f}d | PH: {ph_left:.1f}d")
+            total = last_off_for_user(uid)                  # total balance (Final Off)
+            ph_left, _ = compute_ph_entries_active(uid)     # PH balance
+            normal = total - ph_left                        # derive Normal
+            lines.append(
+                f"• {name} ({uid}) — Total: {total:.1f}d | Normal: {normal:.1f}d | PH: {ph_left:.1f}d"
+            )
         except Exception:
-            lines.append(f"• {name} ({uid}) — Normal: ? | PH: ?")
+            lines.append(f"• {name} ({uid}) — Total: ? | Normal: ? | PH: ?")
 
     out = ""
     for line in lines:
@@ -566,8 +574,9 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_quiet(update, out, parse_mode="Markdown")
         except Exception:
             await reply_quiet(update, out)
-
+            
 # ------------------- Onboarding /newuser -------------------------------------
+
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == "private":
