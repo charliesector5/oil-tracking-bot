@@ -381,6 +381,53 @@ def build_calendar(
     keyboard = [header, week_hdr] + rows + [nav, cancel]
     return InlineKeyboardMarkup(keyboard)
 
+# -----------------------------------------------------------------------------
+# Helpers: Adjust OIL user picker
+# -----------------------------------------------------------------------------
+ADJUST_OIL_PAGE_SIZE = 8
+
+def get_known_users() -> List[Tuple[str, str]]:
+    """
+    Returns a sorted list of unique users from sheet:
+    [(telegram_id, name), ...]
+    """
+    rows = get_all_rows()
+    seen = {}
+    for r in rows[1:]:
+        if len(r) < 3:
+            continue
+        tid = r[1].strip()
+        name = r[2].strip() or tid
+        if not tid.isdigit():
+            continue
+        seen[tid] = name
+    return sorted(seen.items(), key=lambda x: x[1].lower())
+
+def build_adjustoil_keyboard(session_id: str, users: List[Tuple[str, str]], page: int = 0) -> InlineKeyboardMarkup:
+    start = page * ADJUST_OIL_PAGE_SIZE
+    end = start + ADJUST_OIL_PAGE_SIZE
+    chunk = users[start:end]
+
+    keyboard = []
+    for tid, name in chunk:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{name} ({tid})",
+                callback_data=f"adjuser|{session_id}|{tid}"
+            )
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« Prev", callback_data=f"adjpage|{session_id}|{page-1}"))
+    if end < len(users):
+        nav_row.append(InlineKeyboardButton("Next »", callback_data=f"adjpage|{session_id}|{page+1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{session_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
 def validate_half_step(x: float) -> bool:
     return abs((x * 10) % 5) < 1e-9
 
@@ -427,6 +474,7 @@ HELP_TEXT = (
     "/claimphoff – Claim Public Holiday OIL (PH)\n"
     "/massclockoff – Admin: Mass clock normal OIL for all\n"
     "/massclockphoff – Admin: Mass clock PH OIL for all (with preview)\n"
+    "/adjustoil – Admin: Adjust normal OIL for a selected user\n"
     "/newuser – Import your old records (onboarding)\n"
     "/startadmin – Start admin session (PM only)\n"
     "/summary – Your Total OIL Balance + breakdown\n"
@@ -787,12 +835,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await newuser_review(update, context, st)
             return
 
+    if st["flow"] == "adjust_oil":
+        if st["stage"] == "awaiting_amount":
+            try:
+                amt = float(text)
+                if amt == 0:
+                    raise ValueError()
+                if not validate_half_step(abs(amt)):
+                    raise ValueError()
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Enter a non-zero amount in 0.5 steps.\nExamples: 1.0, -0.5, 2.5",
+                    reply_markup=cancel_keyboard(st["sid"])
+                )
+                return
+
+            st["amount"] = amt
+            st["stage"] = "awaiting_reason"
+            await update.message.reply_text(
+                "📝 Enter reason (max 80 chars):",
+                reply_markup=cancel_keyboard(st["sid"])
+            )
+            return
+
+        elif st["stage"] == "awaiting_reason":
+            st["reason"] = text[:80]
+            st["stage"] = "awaiting_app_date"
+            st["min_date"] = date.today() - timedelta(days=365)
+            st["max_date"] = date.today() + timedelta(days=365)
+            cur = date.today()
+            await update.message.reply_text(
+                f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
+                parse_mode="Markdown",
+                reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
+            )
+            return
+
     # ---- manual date entry (single) ----
     if st.get("stage") == "awaiting_app_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
             await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
+
+        if st.get("flow") == "adjust_oil":
+            st["app_date"] = d
+            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
+            await update.message.reply_text(
+                f"🧾 *Confirm OIL Adjustment*\n\n"
+                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
+                f"📌 Action: {action_label}\n"
+                f"📅 Amount: {st['amount']:.1f}\n"
+                f"📝 Reason: {st['reason']}\n"
+                f"🗓 Date: {st['app_date']}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{st['sid']}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['sid']}")
+                ]])
+            )
+            return
+
         ok, msg = validate_application_date(st.get("action",""), d)
         if not ok:
             await reply_quiet(update, msg, reply_markup=cancel_keyboard(st["sid"]))
@@ -880,6 +983,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "noop":
         return
 
+    if kind == "adjpage":
+        if _not_owner_block() or st.get("flow") != "adjust_oil":
+            await q.answer("This isn’t your session.", show_alert=True)
+            return
+        try:
+            page = int(parts[2])
+        except Exception:
+            page = 0
+        st["page"] = page
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=build_adjustoil_keyboard(sid, st["users"], page=page)
+            )
+        except Exception:
+            pass
+        return
+
     # Calendar navigation / selection requires active state & ownership
     if kind in ("calnav", "manual", "cal"):
         if _not_owner_block():
@@ -904,6 +1024,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "manual":
+        if st["flow"] == "adjust_oil" and st["stage"] == "awaiting_app_date":
+            st["app_date"] = chosen
+            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
+            await q.edit_message_text(
+                f"🧾 *Confirm OIL Adjustment*\n\n"
+                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
+                f"📌 Action: {action_label}\n"
+                f"📅 Amount: {st['amount']:.1f}\n"
+                f"📝 Reason: {st['reason']}\n"
+                f"🗓 Date: {st['app_date']}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{sid}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{sid}")
+                ]])
+            )
+            return
+
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             st["stage"] = "awaiting_app_date_manual"
             await q.edit_message_text("⌨️ Type the application date as YYYY-MM-DD.", reply_markup=cancel_keyboard(sid))
@@ -918,8 +1056,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         return
 
+    if kind == "adjuser":
+        if _not_owner_block() or st.get("flow") != "adjust_oil":
+            await q.answer("This isn’t your session.", show_alert=True)
+            return
+
+        target_uid = parts[2]
+        target_name = dict(st["users"]).get(target_uid, target_uid)
+
+        st["target_uid"] = target_uid
+        st["target_name"] = target_name
+        st["stage"] = "awaiting_amount"
+
+        await q.edit_message_text(
+            f"👤 Selected: *{target_name}* ({target_uid})\n\n"
+            f"Enter adjustment amount.\n"
+            f"Use positive to add, negative to subtract.\n"
+            f"Examples: `1.0`, `-0.5`",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard(sid)
+        )
+        return
+
     if kind == "cal":
         chosen = parts[2]
+        if st["flow"] == "adjust_oil" and st["stage"] == "awaiting_app_date":
+            st["app_date"] = chosen
+            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
+            await q.edit_message_text(
+                f"🧾 *Confirm OIL Adjustment*\n\n"
+                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
+                f"📌 Action: {action_label}\n"
+                f"📅 Amount: {st['amount']:.1f}\n"
+                f"📝 Reason: {st['reason']}\n"
+                f"🗓 Date: {st['app_date']}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{sid}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{sid}")
+                ]])
+            )
+            return
+
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             ok, msg = validate_application_date(st.get("action",""), chosen)
             if not ok:
@@ -1302,6 +1480,47 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=cancel_keyboard(sid)
     )
 
+async def cmd_adjustoil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("Run this in the group you want to affect.")
+        return
+
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
+            await update.message.reply_text("Only admins can use this.")
+            return
+    except Exception:
+        pass
+
+    users = get_known_users()
+    if not users:
+        await update.message.reply_text("No users found in sheet.")
+        return
+
+    sid = str(uuid4())[:10]
+    user_state[update.effective_user.id] = {
+        "sid": sid,
+        "flow": "adjust_oil",
+        "stage": "awaiting_user_select",
+        "group_id": chat.id,
+        "users": users,
+        "page": 0,
+        "target_uid": None,
+        "target_name": None,
+        "amount": None,
+        "reason": None,
+        "app_date": None,
+        "owner_id": update.effective_user.id,
+    }
+
+    await update.message.reply_text(
+        "🛠 *Adjust OIL*\n\nSelect a user to adjust:",
+        parse_mode="Markdown",
+        reply_markup=build_adjustoil_keyboard(sid, users, page=0)
+    )
+
 # -----------------------------------------------------------------------------
 # Newuser review & apply
 # -----------------------------------------------------------------------------
@@ -1610,6 +1829,7 @@ async def init_app():
 
     telegram_app.add_handler(CommandHandler("massclockoff", cmd_massclockoff))
     telegram_app.add_handler(CommandHandler("massclockphoff", cmd_massclockphoff))
+    telegram_app.add_handler(CommandHandler("adjustoil", cmd_adjustoil))
 
     telegram_app.add_handler(CommandHandler("newuser", cmd_newuser))
 
