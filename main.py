@@ -1097,6 +1097,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
             return
+            if kind == "adjconfirm":
+    if _not_owner_block() or st.get("flow") != "adjust_oil":
+        return
+
+    try:
+        current_off = last_off_for_user(st["target_uid"])
+        add = st["amount"]
+        final = current_off + add
+
+        append_row(
+            user_id=st["target_uid"],
+            user_name=st["target_name"],
+            action="Clock Off" if add > 0 else "Claim Off",
+            current_off=current_off,
+            add_subtract=add,
+            final_off=final,
+            approved_by=q.from_user.full_name,
+            application_date=st["app_date"],
+            remarks=st["reason"],
+            is_ph=False,
+            ph_total=0.0,
+            expiry=""
+        )
+    except Exception:
+        log.exception("Failed to append row for adjustoil")
+        try:
+            await q.edit_message_text("❌ Failed to record adjustment.")
+        except Exception:
+            pass
+        return
+
+    try:
+        await q.edit_message_text(
+            f"✅ OIL adjusted for {st['target_name']} ({st['target_uid']})\n"
+            f"Action: {'Clock Off' if add > 0 else 'Claim Off'}\n"
+            f"Amount: {add:.1f}\n"
+            f"Previous: {current_off:.1f}\n"
+            f"Final: {final:.1f}\n"
+            f"Reason: {st['reason']}\n"
+            f"Date: {st['app_date']}"
+        )
+    except Exception:
+        pass
+
+    user_state.pop(uid, None)
+    return
 
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             ok, msg = validate_application_date(st.get("action",""), chosen)
