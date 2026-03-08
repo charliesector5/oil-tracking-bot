@@ -1097,7 +1097,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
             return
-            if kind == "adjconfirm":
+            
+    if kind == "adjconfirm":
     if _not_owner_block() or st.get("flow") != "adjust_oil":
         return
 
@@ -1143,6 +1144,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_state.pop(uid, None)
     return
+
 
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             ok, msg = validate_application_date(st.get("action",""), chosen)
