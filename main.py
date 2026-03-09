@@ -90,30 +90,14 @@ def last_off_for_user(user_id: str) -> float:
     except Exception:
         return 0.0
 
-def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, Any]], float]:
+def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
     """
-    Return:
-      - active PH total left
-      - active PH entries
-      - expired PH total left (unused expired PH that still sits inside stored Final Off)
-
-    Logic:
-    - Only rows marked Holiday Off == 'Yes'
-    - Claims are applied FIFO against NON-EXPIRED clocks only
-    - Expired PH is excluded from active PH, but still tracked separately so callers
-      can remove it from the stored Final Off at display time.
+    Return (ph_total_left, active_entries_list).
+    active_entries_list: list of dicts with keys: date, expiry, reason, qty
+    Logic: FIFO across rows marked Holiday Off == 'Yes'.
     """
     rows = get_all_rows()
     ph_events = []
-
-    def dparse(s):
-        try:
-            return datetime.strptime(s, "%Y-%m-%d").date()
-        except Exception:
-            return date(2100, 1, 1)
-
-    today = date.today()
-
     for r in rows[1:]:
         if len(r) < 13:
             continue
@@ -121,7 +105,6 @@ def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, A
         is_ph = (len(r) >= 11 and (r[10].strip().lower() in ("yes", "y", "true", "1")))  # K: Holiday Off
         if rid != str(user_id) or not is_ph:
             continue
-
         qty_raw = r[5].strip() if len(r) > 5 else ""
         qty = 0.0
         if qty_raw:
@@ -131,11 +114,9 @@ def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, A
                 qty = 0.0
             if qty_raw.startswith("-"):
                 qty = -abs(qty)
-
         app_date = r[8].strip() if len(r) > 8 else ""
         expiry = r[12].strip() if len(r) > 12 else ""
-        reason = r[9].strip() if len(r) > 9 else ""
-
+        reason = r[9].strip() if len(r) > 9 else ""  # J remarks
         ph_events.append({
             "action": action,
             "qty": qty,
@@ -144,53 +125,34 @@ def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, A
             "reason": reason
         })
 
-    # Split positive PH grants into non-expired and expired buckets first.
-    active_clocks = []
-    expired_clocks = []
+    clocks = []
     for e in ph_events:
         if e["qty"] > 0:
-            item = {
+            clocks.append({
                 "date": e["app_date"],
                 "expiry": e["expiry"],
                 "reason": e["reason"],
                 "qty": e["qty"]
-            }
-            exp = dparse(e["expiry"])
-            if exp < today:
-                expired_clocks.append(item)
-            else:
-                active_clocks.append(item)
+            })
 
-    # FIFO by expiry for NON-EXPIRED clocks only
-    active_clocks.sort(key=lambda x: dparse(x["expiry"]))
+    def dparse(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return date(2100, 1, 1)
+    clocks.sort(key=lambda x: dparse(x["expiry"]))
 
-    # Claims reduce only non-expired clocks
     claims_total = sum(-e["qty"] for e in ph_events if e["qty"] < 0)
-    for c in active_clocks:
+    for c in clocks:
         if claims_total <= 0:
             break
         use = min(c["qty"], claims_total)
         c["qty"] -= use
         claims_total -= use
 
-    active = [c for c in active_clocks if c["qty"] > 0.0001]
-    active_total = sum(c["qty"] for c in active)
-
-    # Expired grants are not claimable anymore, but any unused expired quantity still
-    # sits inside the stored Final Off in the sheet. Track it so displays can subtract it.
-    expired_active = [c for c in expired_clocks if c["qty"] > 0.0001]
-    expired_total = sum(c["qty"] for c in expired_active)
-
-    return (round(active_total, 3), active, round(expired_total, 3))
-
-
-def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
-    """
-    Backward-compatible wrapper:
-      return (active PH total left, active PH entries)
-    """
-    active_total, active_entries, _expired_total = _compute_ph_entries_breakdown(user_id)
-    return (active_total, active_entries)
+    active = [c for c in clocks if c["qty"] > 0.0001]
+    total_left = sum(c["qty"] for c in active)
+    return (round(total_left, 3), active)
 
 def append_row(
     user_id: str,
@@ -403,53 +365,6 @@ def build_calendar(
     keyboard = [header, week_hdr] + rows + [nav, cancel]
     return InlineKeyboardMarkup(keyboard)
 
-# -----------------------------------------------------------------------------
-# Helpers: Adjust OIL user picker
-# -----------------------------------------------------------------------------
-ADJUST_OIL_PAGE_SIZE = 8
-
-def get_known_users() -> List[Tuple[str, str]]:
-    """
-    Returns a sorted list of unique users from sheet:
-    [(telegram_id, name), ...]
-    """
-    rows = get_all_rows()
-    seen = {}
-    for r in rows[1:]:
-        if len(r) < 3:
-            continue
-        tid = r[1].strip()
-        name = r[2].strip() or tid
-        if not tid.isdigit():
-            continue
-        seen[tid] = name
-    return sorted(seen.items(), key=lambda x: x[1].lower())
-
-def build_adjustoil_keyboard(session_id: str, users: List[Tuple[str, str]], page: int = 0) -> InlineKeyboardMarkup:
-    start = page * ADJUST_OIL_PAGE_SIZE
-    end = start + ADJUST_OIL_PAGE_SIZE
-    chunk = users[start:end]
-
-    keyboard = []
-    for tid, name in chunk:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{name} ({tid})",
-                callback_data=f"adjuser|{session_id}|{tid}"
-            )
-        ])
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("« Prev", callback_data=f"adjpage|{session_id}|{page-1}"))
-    if end < len(users):
-        nav_row.append(InlineKeyboardButton("Next »", callback_data=f"adjpage|{session_id}|{page+1}"))
-    if nav_row:
-        keyboard.append(nav_row)
-
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{session_id}")])
-    return InlineKeyboardMarkup(keyboard)
-
 def validate_half_step(x: float) -> bool:
     return abs((x * 10) % 5) < 1e-9
 
@@ -496,7 +411,6 @@ HELP_TEXT = (
     "/claimphoff – Claim Public Holiday OIL (PH)\n"
     "/massclockoff – Admin: Mass clock normal OIL for all\n"
     "/massclockphoff – Admin: Mass clock PH OIL for all (with preview)\n"
-    "/adjustoil – Admin: Adjust normal OIL for a selected user\n"
     "/newuser – Import your old records (onboarding)\n"
     "/startadmin – Start admin session (PM only)\n"
     "/summary – Your Total OIL Balance + breakdown\n"
@@ -534,13 +448,12 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
 
-    stored_final = last_off_for_user(uid)
-    ph_total_left, active, expired_left = _compute_ph_entries_breakdown(uid)
-    effective_total = stored_final - expired_left
-    normal_bal = effective_total - ph_total_left
+    bal = last_off_for_user(uid)  
+    ph_total_left, active = compute_ph_entries_active(uid)
+    normal_bal = bal - ph_total_left
 
     lines = []
-    lines.append(f"📊 Current Off Balance: {effective_total:.1f} day(s).")
+    lines.append(f"📊 Current Off Balance: {bal:.1f} day(s).")
     lines.append(f"🗂 Normal OIL Balance: {normal_bal:.1f} day(s)")
     lines.append(f"🏖 PH Off Total: {ph_total_left:.1f} day(s)")
     if active:
@@ -638,10 +551,9 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *OIL Overview*", ""]
     for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
         try:
-            stored_total = last_off_for_user(uid)
-            ph_left, _active_entries, expired_left = _compute_ph_entries_breakdown(uid)
-            total = stored_total - expired_left
-            normal = total - ph_left
+            total = last_off_for_user(uid)                  # total balance (Final Off)
+            ph_left, _ = compute_ph_entries_active(uid)     # PH balance
+            normal = total - ph_left                        # derive Normal
             lines.append(
                 f"• {name} ({uid}) — Total: {total:.1f}d | Normal: {normal:.1f}d | PH: {ph_left:.1f}d"
             )
@@ -859,67 +771,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await newuser_review(update, context, st)
             return
 
-    if st["flow"] == "adjust_oil":
-        if st["stage"] == "awaiting_amount":
-            try:
-                amt = float(text)
-                if amt == 0:
-                    raise ValueError()
-                if not validate_half_step(abs(amt)):
-                    raise ValueError()
-            except ValueError:
-                await update.message.reply_text(
-                    "❌ Enter a non-zero amount in 0.5 steps.\nExamples: 1.0, -0.5, 2.5",
-                    reply_markup=cancel_keyboard(st["sid"])
-                )
-                return
-
-            st["amount"] = amt
-            st["stage"] = "awaiting_reason"
-            await update.message.reply_text(
-                "📝 Enter reason (max 80 chars):",
-                reply_markup=cancel_keyboard(st["sid"])
-            )
-            return
-
-        elif st["stage"] == "awaiting_reason":
-            st["reason"] = text[:80]
-            st["stage"] = "awaiting_app_date"
-            st["min_date"] = date.today() - timedelta(days=365)
-            st["max_date"] = date.today() + timedelta(days=365)
-            cur = date.today()
-            await update.message.reply_text(
-                f"{bold('📅 Select Application Date:')}\n• Tap a date below, or\n• Tap {bold('Manual entry')}, then type YYYY-MM-DD.",
-                parse_mode="Markdown",
-                reply_markup=build_calendar(st["sid"], cur, st["min_date"], st["max_date"])
-            )
-            return
-
     # ---- manual date entry (single) ----
     if st.get("stage") == "awaiting_app_date_manual":
         d = parse_date_yyyy_mm_dd(text)
         if not d:
             await reply_quiet(update, "Invalid date. Please type YYYY-MM-DD.", reply_markup=cancel_keyboard(st["sid"]))
             return
-
-        if st.get("flow") == "adjust_oil":
-            st["app_date"] = d
-            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
-            await update.message.reply_text(
-                f"🧾 *Confirm OIL Adjustment*\n\n"
-                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
-                f"📌 Action: {action_label}\n"
-                f"📅 Amount: {st['amount']:.1f}\n"
-                f"📝 Reason: {st['reason']}\n"
-                f"🗓 Date: {st['app_date']}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{st['sid']}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{st['sid']}")
-                ]])
-            )
-            return
-
         ok, msg = validate_application_date(st.get("action",""), d)
         if not ok:
             await reply_quiet(update, msg, reply_markup=cancel_keyboard(st["sid"]))
@@ -1007,23 +864,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "noop":
         return
 
-    if kind == "adjpage":
-        if _not_owner_block() or st.get("flow") != "adjust_oil":
-            await q.answer("This isn’t your session.", show_alert=True)
-            return
-        try:
-            page = int(parts[2])
-        except Exception:
-            page = 0
-        st["page"] = page
-        try:
-            await q.edit_message_reply_markup(
-                reply_markup=build_adjustoil_keyboard(sid, st["users"], page=page)
-            )
-        except Exception:
-            pass
-        return
-
     # Calendar navigation / selection requires active state & ownership
     if kind in ("calnav", "manual", "cal"):
         if _not_owner_block():
@@ -1048,24 +888,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "manual":
-        if st["flow"] == "adjust_oil" and st["stage"] == "awaiting_app_date":
-            st["app_date"] = chosen
-            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
-            await q.edit_message_text(
-                f"🧾 *Confirm OIL Adjustment*\n\n"
-                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
-                f"📌 Action: {action_label}\n"
-                f"📅 Amount: {st['amount']:.1f}\n"
-                f"📝 Reason: {st['reason']}\n"
-                f"🗓 Date: {st['app_date']}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{sid}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{sid}")
-                ]])
-            )
-            return
-
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             st["stage"] = "awaiting_app_date_manual"
             await q.edit_message_text("⌨️ Type the application date as YYYY-MM-DD.", reply_markup=cancel_keyboard(sid))
@@ -1080,49 +902,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         return
 
-    if kind == "adjuser":
-        if _not_owner_block() or st.get("flow") != "adjust_oil":
-            await q.answer("This isn’t your session.", show_alert=True)
-            return
-
-        target_uid = parts[2]
-        target_name = dict(st["users"]).get(target_uid, target_uid)
-
-        st["target_uid"] = target_uid
-        st["target_name"] = target_name
-        st["stage"] = "awaiting_amount"
-
-        await q.edit_message_text(
-            f"👤 Selected: *{target_name}* ({target_uid})\n\n"
-            f"Enter adjustment amount.\n"
-            f"Use positive to add, negative to subtract.\n"
-            f"Examples: `1.0`, `-0.5`",
-            parse_mode="Markdown",
-            reply_markup=cancel_keyboard(sid)
-        )
-        return
-
     if kind == "cal":
         chosen = parts[2]
-
-        if st["flow"] == "adjust_oil" and st["stage"] == "awaiting_app_date":
-            st["app_date"] = chosen
-            action_label = "Clock Off" if st["amount"] > 0 else "Claim Off"
-            await q.edit_message_text(
-                f"🧾 *Confirm OIL Adjustment*\n\n"
-                f"👤 User: {st['target_name']} ({st['target_uid']})\n"
-                f"📌 Action: {action_label}\n"
-                f"📅 Amount: {st['amount']:.1f}\n"
-                f"📝 Reason: {st['reason']}\n"
-                f"🗓 Date: {st['app_date']}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm", callback_data=f"adjconfirm|{sid}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{sid}")
-                ]])
-            )
-            return
-
         if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
             ok, msg = validate_application_date(st.get("action",""), chosen)
             if not ok:
@@ -1177,53 +958,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["stage"] = "ph_reason"
             await send_group_quiet(context, q.message.chat.id, f"PH Entry {idx+1}/{nu['ph_count']} — Enter *PH name* (max 80 chars):", parse_mode="Markdown", reply_markup=cancel_keyboard(sid))
             return
-
-    if kind == "adjconfirm":
-        if _not_owner_block() or st.get("flow") != "adjust_oil":
-            return
-
-        try:
-            current_off = last_off_for_user(st["target_uid"])
-            add = st["amount"]
-            final = current_off + add
-
-            append_row(
-                user_id=st["target_uid"],
-                user_name=st["target_name"],
-                action="Clock Off" if add > 0 else "Claim Off",
-                current_off=current_off,
-                add_subtract=add,
-                final_off=final,
-                approved_by=q.from_user.full_name,
-                application_date=st["app_date"],
-                remarks=st["reason"],
-                is_ph=False,
-                ph_total=0.0,
-                expiry=""
-            )
-        except Exception:
-            log.exception("Failed to append row for adjustoil")
-            try:
-                await q.edit_message_text("❌ Failed to record adjustment.")
-            except Exception:
-                pass
-            return
-
-        try:
-            await q.edit_message_text(
-                f"✅ OIL adjusted for {st['target_name']} ({st['target_uid']})\n"
-                f"Action: {'Clock Off' if add > 0 else 'Claim Off'}\n"
-                f"Amount: {add:.1f}\n"
-                f"Previous: {current_off:.1f}\n"
-                f"Final: {final:.1f}\n"
-                f"Reason: {st['reason']}\n"
-                f"Date: {st['app_date']}"
-            )
-        except Exception:
-            pass
-
-        user_state.pop(uid, None)
-        return
 
     if kind == "massgo" and st and st.get("stage") == "mass_confirm":
         if _not_owner_block():
@@ -1552,47 +1286,6 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=cancel_keyboard(sid)
     )
 
-async def cmd_adjustoil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("Run this in the group you want to affect.")
-        return
-
-    try:
-        admins = await context.bot.get_chat_administrators(chat.id)
-        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
-            await update.message.reply_text("Only admins can use this.")
-            return
-    except Exception:
-        pass
-
-    users = get_known_users()
-    if not users:
-        await update.message.reply_text("No users found in sheet.")
-        return
-
-    sid = str(uuid4())[:10]
-    user_state[update.effective_user.id] = {
-        "sid": sid,
-        "flow": "adjust_oil",
-        "stage": "awaiting_user_select",
-        "group_id": chat.id,
-        "users": users,
-        "page": 0,
-        "target_uid": None,
-        "target_name": None,
-        "amount": None,
-        "reason": None,
-        "app_date": None,
-        "owner_id": update.effective_user.id,
-    }
-
-    await update.message.reply_text(
-        "🛠 *Adjust OIL*\n\nSelect a user to adjust:",
-        parse_mode="Markdown",
-        reply_markup=build_adjustoil_keyboard(sid, users, page=0)
-    )
-
 # -----------------------------------------------------------------------------
 # Newuser review & apply
 # -----------------------------------------------------------------------------
@@ -1901,7 +1594,6 @@ async def init_app():
 
     telegram_app.add_handler(CommandHandler("massclockoff", cmd_massclockoff))
     telegram_app.add_handler(CommandHandler("massclockphoff", cmd_massclockphoff))
-    telegram_app.add_handler(CommandHandler("adjustoil", cmd_adjustoil))
 
     telegram_app.add_handler(CommandHandler("newuser", cmd_newuser))
 
