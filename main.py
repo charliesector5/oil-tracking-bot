@@ -90,14 +90,18 @@ def last_off_for_user(user_id: str) -> float:
     except Exception:
         return 0.0
 
-def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
+def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, Any]], float]:
     """
-    Return (ph_total_left, active_entries_list).
-    active_entries_list: list of dicts with keys: date, expiry, reason, qty
+    Return:
+      - active PH total left
+      - active PH entries
+      - expired PH total left (unused expired PH that still sits inside stored Final Off)
+
     Logic:
     - Only rows marked Holiday Off == 'Yes'
-    - Expired PH entries are ignored entirely
-    - FIFO deduction applies only to non-expired PH entries
+    - Claims are applied FIFO against NON-EXPIRED clocks only
+    - Expired PH is excluded from active PH, but still tracked separately so callers
+      can remove it from the stored Final Off at display time.
     """
     rows = get_all_rows()
     ph_events = []
@@ -140,44 +144,53 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
             "reason": reason
         })
 
-    # Build only NON-EXPIRED positive PH entries
-    clocks = []
+    # Split positive PH grants into non-expired and expired buckets first.
+    active_clocks = []
+    expired_clocks = []
     for e in ph_events:
         if e["qty"] > 0:
-            exp = dparse(e["expiry"])
-            if exp < today:
-                continue
-            clocks.append({
+            item = {
                 "date": e["app_date"],
                 "expiry": e["expiry"],
                 "reason": e["reason"],
                 "qty": e["qty"]
-            })
+            }
+            exp = dparse(e["expiry"])
+            if exp < today:
+                expired_clocks.append(item)
+            else:
+                active_clocks.append(item)
 
-    # FIFO by expiry
-    clocks.sort(key=lambda x: dparse(x["expiry"]))
+    # FIFO by expiry for NON-EXPIRED clocks only
+    active_clocks.sort(key=lambda x: dparse(x["expiry"]))
 
     # Claims reduce only non-expired clocks
     claims_total = sum(-e["qty"] for e in ph_events if e["qty"] < 0)
-    for c in clocks:
+    for c in active_clocks:
         if claims_total <= 0:
             break
         use = min(c["qty"], claims_total)
         c["qty"] -= use
         claims_total -= use
-		
-	active = [c for c in clocks if c["qty"] > 0.0001]
-    total_left = sum(c["qty"] for c in active)
-    
-    # Calculate expired unused PH
-    expired_left = 0.0
-    for e in ph_events:
-        if e["qty"] > 0:
-            exp = dparse(e["expiry"])
-            if exp < today:
-                expired_left += e["qty"]
-    
-    return (round(total_left, 3), active, round(expired_left, 3))
+
+    active = [c for c in active_clocks if c["qty"] > 0.0001]
+    active_total = sum(c["qty"] for c in active)
+
+    # Expired grants are not claimable anymore, but any unused expired quantity still
+    # sits inside the stored Final Off in the sheet. Track it so displays can subtract it.
+    expired_active = [c for c in expired_clocks if c["qty"] > 0.0001]
+    expired_total = sum(c["qty"] for c in expired_active)
+
+    return (round(active_total, 3), active, round(expired_total, 3))
+
+
+def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Backward-compatible wrapper:
+      return (active PH total left, active PH entries)
+    """
+    active_total, active_entries, _expired_total = _compute_ph_entries_breakdown(user_id)
+    return (active_total, active_entries)
 
 def append_row(
     user_id: str,
@@ -521,14 +534,13 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
 
-    bal = last_off_for_user(uid)  
-    ph_total_left, active, expired_left = compute_ph_entries_active(uid)
-    
-    effective_total = bal - expired_left
+    stored_final = last_off_for_user(uid)
+    ph_total_left, active, expired_left = _compute_ph_entries_breakdown(uid)
+    effective_total = stored_final - expired_left
     normal_bal = effective_total - ph_total_left
 
     lines = []
-    lines.append(f"📊 Total OIL Balance: {effective_total:.1f} day(s).")
+    lines.append(f"📊 Current Off Balance: {effective_total:.1f} day(s).")
     lines.append(f"🗂 Normal OIL Balance: {normal_bal:.1f} day(s)")
     lines.append(f"🏖 PH Off Total: {ph_total_left:.1f} day(s)")
     if active:
@@ -626,9 +638,10 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *OIL Overview*", ""]
     for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
         try:
-            total = last_off_for_user(uid)                  # total balance (Final Off)
-            ph_left, _ = compute_ph_entries_active(uid)     # PH balance
-            normal = total - ph_left                        # derive Normal
+            stored_total = last_off_for_user(uid)
+            ph_left, _active_entries, expired_left = _compute_ph_entries_breakdown(uid)
+            total = stored_total - expired_left
+            normal = total - ph_left
             lines.append(
                 f"• {name} ({uid}) — Total: {total:.1f}d | Normal: {normal:.1f}d | PH: {ph_left:.1f}d"
             )
