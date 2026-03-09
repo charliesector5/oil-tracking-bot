@@ -90,21 +90,27 @@ def last_off_for_user(user_id: str) -> float:
     except Exception:
         return 0.0
 
-def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
+def _compute_ph_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, Any]], float]:
     """
-    Return (ph_total_left, active_entries_list).
-    active_entries_list: list of dicts with keys: date, expiry, reason, qty
-    Logic: FIFO across rows marked Holiday Off == 'Yes'.
+    Return:
+      (active_ph_total, active_entries_list, expired_ph_total)
+
+    Option B:
+    1) Apply FIFO claims first across all PH grants
+    2) Then split remaining qty into active vs expired
     """
     rows = get_all_rows()
     ph_events = []
+
     for r in rows[1:]:
         if len(r) < 13:
             continue
+
         rid, action = r[1], r[3]
-        is_ph = (len(r) >= 11 and (r[10].strip().lower() in ("yes", "y", "true", "1")))  # K: Holiday Off
+        is_ph = (len(r) >= 11 and (r[10].strip().lower() in ("yes", "y", "true", "1")))
         if rid != str(user_id) or not is_ph:
             continue
+
         qty_raw = r[5].strip() if len(r) > 5 else ""
         qty = 0.0
         if qty_raw:
@@ -114,9 +120,11 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
                 qty = 0.0
             if qty_raw.startswith("-"):
                 qty = -abs(qty)
+
         app_date = r[8].strip() if len(r) > 8 else ""
         expiry = r[12].strip() if len(r) > 12 else ""
-        reason = r[9].strip() if len(r) > 9 else ""  # J remarks
+        reason = r[9].strip() if len(r) > 9 else ""
+
         ph_events.append({
             "action": action,
             "qty": qty,
@@ -124,6 +132,12 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
             "expiry": expiry,
             "reason": reason
         })
+
+    def dparse(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return date(2100, 1, 1)
 
     clocks = []
     for e in ph_events:
@@ -135,65 +149,6 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
                 "qty": e["qty"]
             })
 
-    def dparse(s):
-        try:
-            return datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def compute_special_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, Any]], float]:
-    """Return (active_special_total, active_entries, expired_total) for Special Off."""
-    rows = get_all_rows()
-    events = []
-    for r in rows[1:]:
-        if len(r) < 14:
-            continue
-        rid = r[1]
-        off_type = r[10].strip() if len(r) > 10 else ""
-        if rid != str(user_id) or off_type != "Special":
-            continue
-        qty_raw = r[13].strip() if len(r) > 13 else ""
-        try:
-            qty = float(qty_raw)
-        except Exception:
-            qty = 0.0
-        app_date = r[8].strip() if len(r) > 8 else ""
-        expiry = r[12].strip() if len(r) > 12 else ""
-        reason = r[9].strip() if len(r) > 9 else ""
-        events.append({"qty": qty, "date": app_date, "expiry": expiry, "reason": reason})
-
-    def dparse(s):
-        try:
-            return datetime.strptime(s, "%Y-%m-%d").date()
-        except Exception:
-            return date(2100,1,1)
-
-    grants = [e.copy() for e in events if e["qty"] > 0]
-    grants.sort(key=lambda x: dparse(x["expiry"]))
-
-    claims = sum(-e["qty"] for e in events if e["qty"] < 0)
-
-    for g in grants:
-        if claims <= 0:
-            break
-        use = min(g["qty"], claims)
-        g["qty"] -= use
-        claims -= use
-
-    today = date.today()
-    active=[]
-    expired=0.0
-    for g in grants:
-        if g["qty"] <= 0:
-            continue
-        if dparse(g["expiry"]) < today:
-            expired += g["qty"]
-        else:
-            active.append(g)
-
-    total = sum(g["qty"] for g in active)
-    return round(total,3), active, round(expired,3)
-        except Exception:
-            return date(2100, 1, 1)
     clocks.sort(key=lambda x: dparse(x["expiry"]))
 
     claims_total = sum(-e["qty"] for e in ph_events if e["qty"] < 0)
@@ -204,9 +159,123 @@ def compute_special_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[st
         c["qty"] -= use
         claims_total -= use
 
-    active = [c for c in clocks if c["qty"] > 0.0001]
-    total_left = sum(c["qty"] for c in active)
-    return (round(total_left, 3), active)
+    today = date.today()
+    active = []
+    expired_total = 0.0
+
+    for c in clocks:
+        if c["qty"] <= 0.0001:
+            continue
+
+        exp = dparse(c["expiry"])
+        if exp < today:
+            expired_total += c["qty"]
+        else:
+            active.append(c)
+
+    active_total = sum(c["qty"] for c in active)
+    return (round(active_total, 3), active, round(expired_total, 3))
+
+
+def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]]:
+    active_total, active_entries, _expired_total = _compute_ph_entries_breakdown(user_id)
+    return (active_total, active_entries)
+
+
+def compute_special_entries_breakdown(user_id: str) -> Tuple[float, List[Dict[str, Any]], float]:
+    """
+    Return:
+      (active_special_total, active_entries_list, expired_special_total)
+
+    Uses the same Option B approach:
+    1) Apply FIFO claims first across all Special grants
+    2) Then split remaining qty into active vs expired
+    """
+    rows = get_all_rows()
+    special_events = []
+
+    for r in rows[1:]:
+        if len(r) < 14:
+            continue
+
+        rid, action = r[1], r[3]
+        off_type = r[10].strip().lower() if len(r) > 10 else ""
+        if rid != str(user_id) or off_type != "special":
+            continue
+
+        qty = 0.0
+        total_raw = r[13].strip() if len(r) > 13 else ""
+        if total_raw:
+            try:
+                qty = float(total_raw)
+            except Exception:
+                qty = 0.0
+
+        if qty == 0.0:
+            qty_raw = r[5].strip() if len(r) > 5 else ""
+            if qty_raw:
+                try:
+                    qty = float(qty_raw.replace("+", ""))
+                except Exception:
+                    qty = 0.0
+                if qty_raw.startswith("-"):
+                    qty = -abs(qty)
+
+        app_date = r[8].strip() if len(r) > 8 else ""
+        expiry = r[12].strip() if len(r) > 12 else ""
+        reason = r[9].strip() if len(r) > 9 else ""
+
+        special_events.append({
+            "action": action,
+            "qty": qty,
+            "app_date": app_date,
+            "expiry": expiry,
+            "reason": reason
+        })
+
+    def dparse(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return date(2100, 1, 1)
+
+    clocks = []
+    for e in special_events:
+        if e["qty"] > 0:
+            clocks.append({
+                "date": e["app_date"],
+                "expiry": e["expiry"],
+                "reason": e["reason"],
+                "qty": e["qty"]
+            })
+
+    clocks.sort(key=lambda x: dparse(x["expiry"]))
+
+    claims_total = sum(-e["qty"] for e in special_events if e["qty"] < 0)
+    for c in clocks:
+        if claims_total <= 0:
+            break
+        use = min(c["qty"], claims_total)
+        c["qty"] -= use
+        claims_total -= use
+
+    today = date.today()
+    active = []
+    expired_total = 0.0
+
+    for c in clocks:
+        if c["qty"] <= 0.0001:
+            continue
+
+        exp = dparse(c["expiry"])
+        if exp < today:
+            expired_total += c["qty"]
+        else:
+            active.append(c)
+
+    active_total = sum(c["qty"] for c in active)
+    return (round(active_total, 3), active, round(expired_total, 3))
+
 
 def append_row(
     user_id: str,
@@ -502,17 +571,18 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
 
-    bal = last_off_for_user(uid)  
-    ph_total_left, active = compute_ph_entries_active(uid)
-    special_left, special_active, special_expired = compute_special_entries_breakdown(uid)
-    normal_bal = bal - ph_total_left
+    bal = last_off_for_user(uid)
+    ph_total_left, active, expired_ph_total = _compute_ph_entries_breakdown(uid)
+    special_total_left, _special_active, expired_special_total = compute_special_entries_breakdown(uid)
+    normal_bal = bal - ph_total_left - special_total_left
 
     lines = []
     lines.append(f"📊 Current Off Balance: {bal:.1f} day(s).")
     lines.append(f"🗂 Normal OIL Balance: {normal_bal:.1f} day(s)")
-    lines.append(f"⭐ Special Off Balance: {special_left:.1f} day(s)")
-    lines.append(f"⌛ Expired Special Off: {special_expired:.1f} day(s)")
     lines.append(f"🏖 PH Off Total: {ph_total_left:.1f} day(s)")
+    lines.append(f"⭐ Special Off Balance: {special_total_left:.1f} day(s)")
+    lines.append(f"⌛ Expired PH Off: {expired_ph_total:.1f} day(s)")
+    lines.append(f"⌛ Expired Special Off: {expired_special_total:.1f} day(s)")
     if active:
         lines.append("🔎 PH Off Entries (active):")
         for c in active:
@@ -521,6 +591,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("🔎 PH Off Entries (active): none")
 
     await reply_quiet(update, "\n".join(lines))
+
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -608,15 +679,15 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *OIL Overview*", ""]
     for uid, name in sorted(seen.items(), key=lambda x: x[1].lower()):
         try:
-            total = last_off_for_user(uid)                  # total balance (Final Off)
-            ph_left, _ = compute_ph_entries_active(uid)
-            special_left, _, special_expired = compute_special_entries_breakdown(uid)     # PH balance
-            normal = total - ph_left                        # derive Normal
+            total = last_off_for_user(uid)
+            ph_left, _active_ph, expired_ph_total = _compute_ph_entries_breakdown(uid)
+            special_left, _active_special, expired_special_total = compute_special_entries_breakdown(uid)
+            normal = total - ph_left - special_left
             lines.append(
-                f"• {name} ({uid}) — Total: {total:.1f}d | Normal: {normal:.1f}d | PH: {ph_left:.1f}d | Special: {special_left:.1f}d | ExpiredSpecial: {special_expired:.1f}d"
+                f"• {name} ({uid}) — Total: {total:.1f}d | Normal: {normal:.1f}d | PH: {ph_left:.1f}d | Special: {special_left:.1f}d | ExpPH: {expired_ph_total:.1f}d | ExpSpecial: {expired_special_total:.1f}d"
             )
         except Exception:
-            lines.append(f"• {name} ({uid}) — Total: ? | Normal: ? | PH: ?")
+            lines.append(f"• {name} ({uid}) — Total: ? | Normal: ? | PH: ? | Special: ? | ExpPH: ? | ExpSpecial: ?")
 
     out = ""
     for line in lines:
@@ -632,7 +703,7 @@ async def cmd_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_quiet(update, out, parse_mode="Markdown")
         except Exception:
             await reply_quiet(update, out)
-            
+
 # ------------------- Onboarding /newuser -------------------------------------
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1669,3 +1740,4 @@ if __name__ == "__main__":
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
     log.info("🟢 Starting Flask…")
     app.run(host="0.0.0.0", port=10000)
+compute_ph_entries_active
