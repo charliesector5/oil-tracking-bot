@@ -289,7 +289,9 @@ def append_row(
     remarks: str,
     is_ph: bool,
     ph_total: float,
-    expiry: Optional[str]
+    expiry: Optional[str],
+    is_special: bool = False,
+    special_total: float = 0.0,
 ):
     """
     Append one row in this order (matching your current sheet):
@@ -303,9 +305,10 @@ def append_row(
     H Approved By
     I Application Date
     J Remarks
-    K Holiday Off (Yes/No)
+    K Holiday Off (Yes/No/Special)
     L PH Off Total (number)
     M Expiry (YYYY-MM-DD or '')
+    N Special Off Total (number)
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [
@@ -319,9 +322,10 @@ def append_row(
         approved_by,                       # H
         application_date,                  # I
         remarks,                           # J
-        "Yes" if is_ph else "No",          # K
-        f"{ph_total:.1f}" if is_ph else "",# L
-        expiry or ""                       # M
+        "Special" if is_special else ("Yes" if is_ph else "No"),  # K
+        f"{ph_total:.1f}" if is_ph else "",                       # L
+        expiry or "",                                              # M
+        f"{special_total:.1f}" if is_special else ""              # N
     ]
     worksheet.append_row(row)
 
@@ -355,6 +359,8 @@ def _label_from_action(action: str) -> str:
     if action == "claimoff": return "Claim Off"
     if action == "clockphoff": return "Clock PH Off"
     if action == "claimphoff": return "Claim PH Off"
+    if action == "clockspecialoff": return "Clock Special Off"
+    if action == "claimspecialoff": return "Claim Special Off"
     return action
 
 def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_off: float | None) -> str:
@@ -367,7 +373,7 @@ def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_
             f"Days: {p['days']} | Date: {p['app_date']}",
             f"Reason: {p.get('reason','') or '—'}",
         ]
-        if p.get("is_ph") and p.get("expiry"):
+        if (p.get("is_ph") or p.get("is_special")) and p.get("expiry"):
             lines.append(f"Expiry: {p['expiry']}")
         if final_off is not None and approved:
             lines.append(f"Final Off: {final_off:.1f}")
@@ -375,7 +381,7 @@ def build_admin_summary_text(p: dict, approved: bool, approver_name: str, final_
         return "\n".join(lines)
 
     if p["type"] == "mass":
-        label = "Mass Clock PH" if p["is_ph"] else "Mass Clock"
+        label = "Mass Clock Special" if p.get("is_special") else ("Mass Clock PH" if p["is_ph"] else "Mass Clock")
         return "\n".join([
             f"{t}",
             f"{label}",
@@ -513,7 +519,7 @@ def validate_application_date(action: str, dstr: str) -> tuple[bool, str]:
     past_365 = today - timedelta(days=365)
     future_365 = today + timedelta(days=365)
 
-    is_clock = action in ("clockoff", "clockphoff", "newuser_ph", "mass")
+    is_clock = action in ("clockoff", "clockphoff", "clockspecialoff", "newuser_ph", "mass", "mass_special")
     if is_clock:
         lo, hi = past_365, today
     else:
@@ -532,8 +538,11 @@ HELP_TEXT = (
     "/claimoff – Request to claim normal OIL\n"
     "/clockphoff – Clock Public Holiday OIL (PH)\n"
     "/claimphoff – Claim Public Holiday OIL (PH)\n"
+    "/clockspecialoff – Clock Special Off (MWO / BO etc.)\n"
+    "/claimspecialoff – Claim Special Off\n"
     "/massclockoff – Admin: Mass clock normal OIL for all\n"
     "/massclockphoff – Admin: Mass clock PH OIL for all (with preview)\n"
+    "/massclockspecialoff – Admin: Mass clock Special Off for all (with preview)\n"
     "/newuser – Import your old records (onboarding)\n"
     "/startadmin – Start admin session (PM only)\n"
     "/summary – Your Total OIL Balance + breakdown\n"
@@ -549,7 +558,7 @@ PIN_TEXT = (
     "• /summary shows your Total OIL balance (Normal + PH) and PH entries.  \n"
     "• /overview shows a snapshot (totals, last action, soonest PH expiries).  \n"
     "• /history shows your last 5 logs.  \n"
-    "• Admins: /massclockoff, /massclockphoff.  \n"
+    "• Admins: /massclockoff, /massclockphoff, /massclockspecialoff.  \n"
     "• New teammates: /newuser to import old records.  \n"
     "• Need to stop a flow? Tap ❌ Cancel or type `-quit`.\n"
 )
@@ -625,10 +634,11 @@ async def start_flow_days(update: Update, context: ContextTypes.DEFAULT_TYPE, fl
         "is_ph": is_ph,
         "owner_id": uid,            # guard against cross-user presses
     }
-    icon = "🏖" if is_ph else ("🗂" if action.startswith("claim") else "🕒")
+    icon = "🏖" if is_ph else ("⭐" if flow == "special" else ("🗂" if action.startswith("claim") else "🕒"))
+    off_prefix = "PH " if is_ph else ("Special " if flow == "special" else "")
     await reply_quiet(
         update,
-        f"{icon} How many {'PH ' if is_ph else ''}OIL days do you want to "
+        f"{icon} How many {off_prefix}OIL days do you want to "
         f"{'clock' if 'clock' in action else 'claim'}? (0.5 to 3, in 0.5 steps)\n"
         f"– Date limits will be shown in the next step.",
         reply_markup=cancel_keyboard(sid)
@@ -645,6 +655,12 @@ async def cmd_clockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_claimphoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_flow_days(update, context, "ph", "claimphoff", True)
+
+async def cmd_clockspecialoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, "special", "clockspecialoff", False)
+
+async def cmd_claimspecialoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_flow_days(update, context, "special", "claimspecialoff", False)
 
 # ------------------- Admin overview ------------------------------------------
 
@@ -763,7 +779,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days = float(text)
             if days <= 0:
                 raise ValueError()
-            if st["flow"] in ("normal", "ph", "mass_normal", "mass_ph"):
+            if st["flow"] in ("normal", "ph", "special", "mass_normal", "mass_ph", "mass_special"):
                 if not (0.5 <= days <= 3.0) or not validate_half_step(days):
                     raise ValueError()
         except ValueError:
@@ -804,7 +820,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---- remarks after date (single) ----
-    if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_reason":
+    if st["flow"] in ("normal", "ph", "special") and st["stage"] == "awaiting_reason":
         txt = text.strip()
         action = st.get("action","")
         optional = action in ("claimoff", "claimphoff")
@@ -916,7 +932,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
         elif st.get("action") == "clockphoff":
             prompt = "📝 Enter PH name (e.g., National Day 2025)."
-        elif st.get("action") == "claimoff":
+        elif st.get("action") == "clockspecialoff":
+            prompt = "📝 Enter Special Off name (e.g., MWO 2026, Birthday Off 2026)."
+        elif st.get("action") in ("claimoff", "claimphoff", "claimspecialoff"):
             prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
         else:
             prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
@@ -1017,7 +1035,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "manual":
-        if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
+        if st["flow"] in ("normal", "ph", "special") and st["stage"] == "awaiting_app_date":
             st["stage"] = "awaiting_app_date_manual"
             await q.edit_message_text("⌨️ Type the application date as YYYY-MM-DD.", reply_markup=cancel_keyboard(sid))
             return
@@ -1033,7 +1051,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "cal":
         chosen = parts[2]
-        if st["flow"] in ("normal", "ph") and st["stage"] == "awaiting_app_date":
+        if st["flow"] in ("normal", "ph", "special") and st["stage"] == "awaiting_app_date":
             ok, msg = validate_application_date(st.get("action",""), chosen)
             if not ok:
                 await q.answer(msg, show_alert=True)
@@ -1048,7 +1066,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prompt = "📝 Enter clocking reason (e.g., OT number, event name)."
             elif st.get("action") == "clockphoff":
                 prompt = "📝 Enter PH name (e.g., National Day 2025)."
-            elif st.get("action") == "claimoff":
+            elif st.get("action") == "clockspecialoff":
+                prompt = "📝 Enter Special Off name (e.g., MWO 2026, Birthday Off 2026)."
+            elif st.get("action") in ("claimoff", "claimphoff", "claimspecialoff"):
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
             else:
                 prompt = "📝 Enter remarks (optional). Type 'nil' to skip."
@@ -1069,7 +1089,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             st["stage"] = "awaiting_mass_remarks"
-            await send_group_quiet(context, q.message.chat.id, "📝 Enter remarks for the mass action (reason or PH name).", reply_markup=cancel_keyboard(st["sid"]))
+            mass_prompt = "📝 Enter remarks for the mass action (reason or PH name)."
+            if st.get("is_special"):
+                mass_prompt = "📝 Enter Special Off name for the mass action (e.g., MWO 2026)."
+            await send_group_quiet(context, q.message.chat.id, mass_prompt, reply_markup=cancel_keyboard(st["sid"]))
             return
 
         if st["flow"] == "newuser" and st["stage"] == "ph_date":
@@ -1159,20 +1182,21 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         return
 
     current_off = last_off_for_user(str(uid))
-    add = +days if st["action"] in ("clockoff", "clockphoff") else -days
+    add = +days if st["action"] in ("clockoff", "clockphoff", "clockspecialoff") else -days
     final = current_off + add
     is_ph = st["is_ph"]
+    is_special = st["action"] in ("clockspecialoff", "claimspecialoff")
     app_date = app_date or st.get("app_date","")
 
-    # date window double-check (defense-in-depth)
-    tag = st["action"]
-    ok, msg = validate_application_date(tag, app_date)
+    ok, msg = validate_application_date(st["action"], app_date)
     if not ok:
         await reply_quiet(update, msg)
         return
 
     expiry = ""
     ph_total_after = ""
+    special_total_after = ""
+
     if is_ph:
         if st["action"] == "clockphoff":
             try:
@@ -1182,6 +1206,16 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
                 expiry = ""
         before, _ = compute_ph_entries_active(str(uid))
         ph_total_after = before + (days if st["action"] == "clockphoff" else -days)
+
+    if is_special:
+        if st["action"] == "clockspecialoff":
+            try:
+                d = datetime.strptime(app_date, "%Y-%m-%d").date()
+                expiry = (d + timedelta(days=365)).strftime("%Y-%m-%d")
+            except Exception:
+                expiry = ""
+        before, _active_special, _expired_special = compute_special_entries_breakdown(str(uid))
+        special_total_after = before + (days if st["action"] == "clockspecialoff" else -days)
 
     key = str(uuid4())[:12]
     payload = {
@@ -1196,12 +1230,13 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         "current_off": current_off,
         "final_off": final,
         "is_ph": is_ph,
+        "is_special": is_special,
         "expiry": expiry,
         "ph_total_after": ph_total_after if ph_total_after != "" else None,
+        "special_total_after": special_total_after if special_total_after != "" else None,
         "admin_msgs": []
     }
 
-    # send to admins and store PM refs
     try:
         admins = await context.bot.get_chat_administrators(group_id)
     except Exception:
@@ -1213,10 +1248,12 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
     ]])
 
     label = (
-        "Clock Off" if st["action"]=="clockoff" else
-        "Claim Off" if st["action"]=="claimoff" else
-        "Clock Off (PH)" if st["action"]=="clockphoff" else
-        "Claim Off (PH)"
+        "Clock Off" if st["action"] == "clockoff" else
+        "Claim Off" if st["action"] == "claimoff" else
+        "Clock Off (PH)" if st["action"] == "clockphoff" else
+        "Claim Off (PH)" if st["action"] == "claimphoff" else
+        "Clock Off (Special)" if st["action"] == "clockspecialoff" else
+        "Claim Off (Special)"
     )
 
     text = (
@@ -1232,6 +1269,10 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         text += f"\n🏖 PH Expiry: {expiry}"
         if payload.get("ph_total_after") is not None:
             text += f"\n🏖 PH Total After: {payload['ph_total_after']:.1f}"
+    if is_special and expiry:
+        text += f"\n⭐ Special Expiry: {expiry}"
+        if payload.get("special_total_after") is not None:
+            text += f"\n⭐ Special Total After: {payload['special_total_after']:.1f}"
 
     sent_any = False
     admin_msgs = []
@@ -1254,10 +1295,6 @@ async def finalize_single_request(update: Update, context: ContextTypes.DEFAULT_
         await send_group_quiet(context, group_id, "⚠️ Could not reach any admin. Please ensure the bot can PM admins.")
 
     user_state.pop(uid, None)
-
-# -----------------------------------------------------------------------------
-# Apply single (admin approve/deny) + send receipts + edit all admin PMs
-# -----------------------------------------------------------------------------
 async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any], approved: bool, approver_name: str, approver_id: int):
     gid = p.get("group_id")
     uid = p["user_id"]
@@ -1267,6 +1304,7 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     reason = p["reason"]
     app_date = p["app_date"]
     is_ph = p["is_ph"]
+    is_special = p.get("is_special", False)
     expiry = p.get("expiry")
 
     if not approved:
@@ -1287,6 +1325,11 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_ph:
         ph_total_after = 0.0
 
+    special_total_left, _active_special, _expired_special = compute_special_entries_breakdown(uid)
+    special_total_after = special_total_left + (days if action == "clockspecialoff" else (-days if action == "claimspecialoff" else 0))
+    if not is_special:
+        special_total_after = 0.0
+
     try:
         append_row(
             user_id=uid,
@@ -1300,13 +1343,16 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             remarks=reason or "—",
             is_ph=is_ph,
             ph_total=ph_total_after if is_ph else 0.0,
-            expiry=expiry if is_ph else ""
+            expiry=expiry if (is_ph or is_special) else "",
+            is_special=is_special,
+            special_total=special_total_after if is_special else 0.0,
         )
     except Exception:
         log.exception("Failed to append row for single apply")
 
+    off_prefix = "Special " if is_special else ("PH " if is_ph else "")
     msg = (
-        f"✅ {uname}'s {('PH ' if is_ph else '')}{'Clock Off' if 'clock' in action else 'Claim Off'} approved by {approver_name}.\n"
+        f"✅ {uname}'s {off_prefix}{'Clock Off' if 'clock' in action else 'Claim Off'} approved by {approver_name}.\n"
         f"🗓 Application Date: {app_date}\n"
         f"📅 Days: {days}\n"
         f"📝 Reason: {reason or '—'}\n"
@@ -1314,6 +1360,8 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     if is_ph and expiry:
         msg += f"\n🏖 PH Expiry: {expiry}"
+    if is_special and expiry:
+        msg += f"\n⭐ Special Expiry: {expiry}"
     try:
         await send_group_quiet(context, gid, msg)
     except Exception:
@@ -1321,10 +1369,6 @@ async def handle_single_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     summary = build_admin_summary_text(p, approved=True, approver_name=approver_name, final_off=final)
     await update_all_admin_pm(context, p, summary)
-
-# -----------------------------------------------------------------------------
-# Mass preview & apply
-# -----------------------------------------------------------------------------
 async def mass_preview_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, st: Dict[str, Any]):
     chat_id = st["group_id"]
     rows = get_all_rows()
@@ -1375,6 +1419,7 @@ async def cmd_massclockoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "stage": "awaiting_days",
         "group_id": chat.id,
         "is_ph": False,
+        "is_special": False,
         "owner_id": update.effective_user.id,
     }
     await reply_quiet(
@@ -1415,6 +1460,38 @@ async def cmd_massclockphoff(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=cancel_keyboard(sid)
     )
 
+
+
+async def cmd_massclockspecialoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("Run this in the group you want to affect.")
+        return
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        if update.effective_user.id not in [a.user.id for a in admins if not a.user.is_bot]:
+            await reply_quiet(update, "Only admins can use this.")
+            return
+    except Exception:
+        pass
+
+    sid = str(uuid4())[:10]
+    user_state[update.effective_user.id] = {
+        "sid": sid,
+        "flow": "mass_special",
+        "stage": "awaiting_days",
+        "group_id": chat.id,
+        "is_ph": False,
+        "is_special": True,
+        "owner_id": update.effective_user.id,
+    }
+    await reply_quiet(
+        update,
+        "👥 Mass Clock *Special* Off — How many days per user? (0.5 to 3, in 0.5 steps)\n"
+        "You’ll next choose a date (allowed: today-365 to today) and set a Special Off name.",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard(sid)
+    )
 # -----------------------------------------------------------------------------
 # Newuser review & apply
 # -----------------------------------------------------------------------------
@@ -1565,6 +1642,7 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
     gid = st["group_id"]
     days = st["days"]
     is_ph = st["is_ph"]
+    is_special = st.get("is_special", False)
     targets = st["mass_targets"]
 
     key = str(uuid4())[:12]
@@ -1573,6 +1651,7 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
         "group_id": gid,
         "days": days,
         "is_ph": is_ph,
+        "is_special": is_special,
         "targets": targets,
         "admin_msgs": [],
         "reason": st.get("reason",""),
@@ -1582,7 +1661,7 @@ async def mass_send_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve|{key}"),
                                 InlineKeyboardButton("❌ Deny", callback_data=f"deny|{key}")]])
 
-    label = "Mass Clock PH" if is_ph else "Mass Clock"
+    label = "Mass Clock Special" if is_special else ("Mass Clock PH" if is_ph else "Mass Clock")
     listing = "\n".join([f"- {t['name']} ({t['user_id']})" for t in targets])
     txt = (
         f"🆕 *{label}* — Days per user: {days}\n"
@@ -1619,8 +1698,9 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
     gid = p["group_id"]
     days = p["days"]
     is_ph = p["is_ph"]
+    is_special = p.get("is_special", False)
     targets = p["targets"]
-    label = "Mass Clock PH" if is_ph else "Mass Clock"
+    label = "Mass Clock Special" if is_special else ("Mass Clock PH" if is_ph else "Mass Clock")
 
     if not approved:
         try:
@@ -1641,11 +1721,20 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
 
         expiry = ""
         ph_total_after = 0.0
+        special_total_after = 0.0
+        if is_ph or is_special:
+            ad = p.get("app_date", date.today().strftime("%Y-%m-%d"))
+            try:
+                dd = datetime.strptime(ad, "%Y-%m-%d").date()
+                expiry = (dd + timedelta(days=365)).strftime("%Y-%m-%d")
+            except Exception:
+                expiry = ""
         if is_ph:
-            today = date.today()
-            expiry = (today + timedelta(days=365)).strftime("%Y-%m-%d")
             before, _ = compute_ph_entries_active(uid)
             ph_total_after = before + days
+        if is_special:
+            before, _active, _expired = compute_special_entries_breakdown(uid)
+            special_total_after = before + days
 
         try:
             append_row(
@@ -1660,7 +1749,9 @@ async def handle_mass_apply(context: ContextTypes.DEFAULT_TYPE, p: Dict[str,Any]
                 remarks=p.get("reason","Mass clock"),
                 is_ph=is_ph,
                 ph_total=ph_total_after if is_ph else 0.0,
-                expiry=expiry if is_ph else ""
+                expiry=expiry if (is_ph or is_special) else "",
+                is_special=is_special,
+                special_total=special_total_after if is_special else 0.0,
             )
             count_ok += 1
         except Exception:
@@ -1720,9 +1811,12 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("claimoff", cmd_claimoff))
     telegram_app.add_handler(CommandHandler("clockphoff", cmd_clockphoff))
     telegram_app.add_handler(CommandHandler("claimphoff", cmd_claimphoff))
+    telegram_app.add_handler(CommandHandler("clockspecialoff", cmd_clockspecialoff))
+    telegram_app.add_handler(CommandHandler("claimspecialoff", cmd_claimspecialoff))
 
     telegram_app.add_handler(CommandHandler("massclockoff", cmd_massclockoff))
     telegram_app.add_handler(CommandHandler("massclockphoff", cmd_massclockphoff))
+    telegram_app.add_handler(CommandHandler("massclockspecialoff", cmd_massclockspecialoff))
 
     telegram_app.add_handler(CommandHandler("newuser", cmd_newuser))
 
@@ -1740,4 +1834,3 @@ if __name__ == "__main__":
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(init_app()))
     log.info("🟢 Starting Flask…")
     app.run(host="0.0.0.0", port=10000)
-compute_ph_entries_active
