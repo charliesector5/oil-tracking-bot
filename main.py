@@ -165,10 +165,19 @@ def compute_ph_entries_active(user_id: str) -> Tuple[float, List[Dict[str, Any]]
         use = min(c["qty"], claims_total)
         c["qty"] -= use
         claims_total -= use
-
-    active = [c for c in clocks if c["qty"] > 0.0001]
+		
+	active = [c for c in clocks if c["qty"] > 0.0001]
     total_left = sum(c["qty"] for c in active)
-    return (round(total_left, 3), active)
+    
+    # Calculate expired unused PH
+    expired_left = 0.0
+    for e in ph_events:
+        if e["qty"] > 0:
+            exp = dparse(e["expiry"])
+            if exp < today:
+                expired_left += e["qty"]
+    
+    return (round(total_left, 3), active, round(expired_left, 3))
 
 def append_row(
     user_id: str,
@@ -513,11 +522,13 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(user.id)
 
     bal = last_off_for_user(uid)  
-    ph_total_left, active = compute_ph_entries_active(uid)
-    normal_bal = bal - ph_total_left
+    ph_total_left, active, expired_left = compute_ph_entries_active(uid)
+    
+    effective_total = bal - expired_left
+    normal_bal = effective_total - ph_total_left
 
     lines = []
-    lines.append(f"📊 Current Off Balance: {bal:.1f} day(s).")
+    lines.append(f"📊 Total OIL Balance: {effective_total:.1f} day(s).")
     lines.append(f"🗂 Normal OIL Balance: {normal_bal:.1f} day(s)")
     lines.append(f"🏖 PH Off Total: {ph_total_left:.1f} day(s)")
     if active:
